@@ -1,0 +1,121 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fasthep-distributed"
+dynamic = ["version"]
+description = "Distributed execution foundations for FAST-HEP."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "FAST-HEP contributors" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+docs = [
+    "myst-parser",
+    "pydata-sphinx-theme",
+    "sphinx",
+    "sphinx-copybutton",
+    "sphinx-design",
+]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+fallback_version = "2026.08.1"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/fasthep_distributed/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fasthep_distributed"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "docs",
+    "src/fasthep_distributed",
+    "tests",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 88
+target-version = "py311"
+extend-exclude = [
+    "src/fasthep_distributed/_version.py",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",
+    "B",
+    "I",
+    "ARG",
+    "C4",
+    "ICN",
+    "ISC",
+    "G",
+    "PGH",
+    "PIE",
+    "PL",
+    "PT",
+    "PTH",
+    "RET",
+    "RUF",
+    "SIM",
+    "T20",
+    "UP",
+    "YTT",
+    "EXE",
+]
+ignore = [
+    "E501",
+    "PLR",
+    "EM101",
+    "EM102",
+    "EM103",
+]
+unfixable = ["T20", "F841"]
+
+[tool.ruff.lint.flake8-unused-arguments]
+ignore-variadic-names = true
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20", "ARG"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = [
+    "-ra",
+    "--showlocals",
+    "--strict-markers",
+    "--strict-config",
+]
+xfail_strict = true
+filterwarnings = ["error"]
+testpaths = ["tests"]

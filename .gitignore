@@ -1,0 +1,37 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Build and package outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+src/fasthep_distributed/_version.py
+
+# Test, type-check and lint caches
+.coverage
+.coverage.*
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+htmlcov/
+
+# Documentation build outputs
+docs/_build/
+
+# Local environments
+.pixi/
+.venv/
+venv/
+env/
+.env
+.envrc
+
+# Tooling
+.pypirc
+.dmypy.json
+dmypy.json
