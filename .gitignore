@@ -35,3 +35,6 @@ env/
 .pypirc
 .dmypy.json
 dmypy.json
+
+# pixi
+pixi.lock
