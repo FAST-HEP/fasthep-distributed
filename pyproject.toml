@@ -23,7 +23,13 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "conda-pack",
+    "dask",
+    "dask-jobqueue",
+    "distributed",
+    "fasthep-flow",
+]
 
 [project.optional-dependencies]
 test = [
