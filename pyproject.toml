@@ -28,7 +28,7 @@ dependencies = [
     "dask",
     "dask-jobqueue",
     "distributed",
-    "fasthep-flow",
+    "fasthep-flow>=2026.08.4",
 ]
 
 [project.optional-dependencies]
