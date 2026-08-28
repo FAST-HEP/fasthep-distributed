@@ -6311,10 +6311,6 @@ packages:
 - pypi: ../flow
   name: fasthep-flow
   requires_dist:
-  - conda-pack
-  - dask
-  - dask-jobqueue
-  - distributed
   - jinja2
   - networkx
   - numpy

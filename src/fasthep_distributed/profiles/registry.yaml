@@ -1,0 +1,4 @@
+registry:
+  backends:
+    dask:
+      impl: fasthep_distributed._dask._common:DaskBackend
