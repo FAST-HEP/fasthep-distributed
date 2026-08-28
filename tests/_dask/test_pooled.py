@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -611,7 +612,8 @@ def test_prepare_prefix_environment_creates_archive_bootstrap_and_manifest(
     assert prepared.bootstrap_script is not None
     bootstrap = prepared.bootstrap_script
     script = bootstrap.read_text(encoding="utf-8")
-    assert 'tar -xzf "$ENV_ARCHIVE" -C worker-env' in script
+    assert "archive.extractall(destination, filter='data')" in script
+    assert 'fasthep_extract_archive "$ENV_ARCHIVE" worker-env' in script
     assert "./worker-env/bin/conda-unpack" in script
     assert script.index("conda-unpack") < script.index("distributed.cli.dask_worker")
     manifest = json.loads(prepared.environment_manifest.read_text(encoding="utf-8"))
@@ -841,15 +843,32 @@ def test_validate_packed_prefix_archive_runs_unpack_and_imports(tmp_path: Path) 
     source = tmp_path / "src"
     bin_dir = source / "bin"
     bin_dir.mkdir(parents=True)
-    for name in ["conda-unpack", "python"]:
+    for name in ["conda-unpack", "python-shim"]:
         script = bin_dir / name
         script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         script.chmod(0o755)
+    (bin_dir / "python").symlink_to("python-shim")
     archive = tmp_path / "prefix.tar.gz"
     with tarfile.open(archive, "w:gz") as handle:
         handle.add(source / "bin", arcname="bin")
 
     validate_packed_prefix_archive(archive, required_imports=["distributed", "hepflow"])
+
+
+def test_validate_packed_prefix_archive_rejects_path_traversal(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "prefix.tar.gz"
+    payload = b"escape"
+    info = tarfile.TarInfo("../escaped.txt")
+    info.size = len(payload)
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.addfile(info, io.BytesIO(payload))
+
+    with pytest.raises(RuntimeError, match="failed local unpack/import preflight"):
+        validate_packed_prefix_archive(archive, required_imports=["distributed"])
+
+    assert not (tmp_path / "escaped.txt").exists()
 
 
 def test_validate_packed_prefix_archive_uses_snapshot_pythonpath(

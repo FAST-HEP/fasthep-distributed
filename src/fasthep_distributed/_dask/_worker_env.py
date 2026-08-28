@@ -374,7 +374,7 @@ def validate_packed_prefix_archive(
         snapshot_dir = Path(tmp) / "editable-snapshot"
         try:
             with tarfile.open(archive_path, "r:gz") as archive:
-                archive.extractall(target)
+                archive.extractall(target, filter="data")
             subprocess.run(
                 [str(target / "bin" / "conda-unpack")],
                 check=True,
@@ -385,7 +385,7 @@ def validate_packed_prefix_archive(
             if editable_snapshot_archive is not None:
                 snapshot_dir.mkdir()
                 with tarfile.open(editable_snapshot_archive, "r:gz") as archive:
-                    archive.extractall(snapshot_dir)
+                    archive.extractall(snapshot_dir, filter="data")
                 pythonpath.insert(0, str(snapshot_dir))
             env = dict(os.environ)
             if pythonpath:
@@ -699,7 +699,7 @@ def write_bootstrap_script(
             "SNAPSHOT_ARCHIVE=\"${FASTHEP_EDITABLE_SNAPSHOT:-editable-snapshot.tar.gz}\"",
             "echo '[fasthep] extracting editable snapshot'",
             "mkdir -p editable-snapshot",
-            "tar -xzf \"$SNAPSHOT_ARCHIVE\" -C editable-snapshot",
+            "fasthep_extract_archive \"$SNAPSHOT_ARCHIVE\" editable-snapshot",
             'export PYTHONPATH="$PWD/editable-snapshot${PYTHONPATH:+:$PYTHONPATH}"',
         ]
     elif shared_path:
@@ -713,10 +713,30 @@ def write_bootstrap_script(
     lines = [
         "#!/bin/sh",
         "set -e",
+        "fasthep_extract_archive() {",
+        "  archive_path=$1",
+        "  destination=$2",
+        "  if command -v python3 >/dev/null 2>&1; then",
+        "    extract_python=python3",
+        "  elif command -v python >/dev/null 2>&1; then",
+        "    extract_python=python",
+        "  else",
+        "    echo '[fasthep] Python is required to safely extract worker archives' >&2",
+        "    exit 1",
+        "  fi",
+        "  \"$extract_python\" - \"$archive_path\" \"$destination\" <<'PY'",
+        "from pathlib import Path",
+        "import sys",
+        "import tarfile",
+        "archive_path, destination = sys.argv[1], Path(sys.argv[2])",
+        "with tarfile.open(archive_path, 'r:gz') as archive:",
+        "    archive.extractall(destination, filter='data')",
+        "PY",
+        "}",
         "ENV_ARCHIVE=\"${FASTHEP_ENV_ARCHIVE:-prefix.tar.gz}\"",
         "echo '[fasthep] extracting packed Pixi prefix'",
         "mkdir -p worker-env",
-        "tar -xzf \"$ENV_ARCHIVE\" -C worker-env",
+        "fasthep_extract_archive \"$ENV_ARCHIVE\" worker-env",
         "echo '[fasthep] running conda-unpack'",
         "./worker-env/bin/conda-unpack",
         *editable_lines,
