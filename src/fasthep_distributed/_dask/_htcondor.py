@@ -187,7 +187,7 @@ def _prepare_htcondor_pool_specs_impl(
         transfer_file_count=len(staged_files.transfer_files) if staged_files else 0,
     )
     paths = _htcondor_execution_paths(build_paths)
-    for path in [build_paths.dask_htcondor_dir("submit"), *paths.values()]:
+    for path in [_dask_htcondor_dir(build_paths, "submit"), *paths.values()]:
         path.mkdir(parents=True, exist_ok=True)
 
     for name, spec in prepared.items():
@@ -205,7 +205,7 @@ def _prepare_htcondor_pool_specs_impl(
                 job_kwargs,
             )
             spec["job_kwargs"] = job_kwargs
-        job_kwargs["submit_directory"] = str(build_paths.dask_htcondor_dir("submit"))
+        job_kwargs["submit_directory"] = str(_dask_htcondor_dir(build_paths, "submit"))
         job_kwargs["job_extra_directives"] = _merge_htcondor_directives(
             dict(job_kwargs.get("job_extra_directives") or {}),
             _htcondor_bootstrap_directives(paths),
@@ -221,10 +221,14 @@ def _prepare_htcondor_pool_specs_impl(
 
 def _htcondor_execution_paths(build_paths: BuildPaths) -> dict[str, Path]:
     return {
-        "logs": build_paths.dask_htcondor_dir("logs"),
-        "out": build_paths.dask_htcondor_dir("out"),
-        "err": build_paths.dask_htcondor_dir("err"),
+        "logs": _dask_htcondor_dir(build_paths, "logs"),
+        "out": _dask_htcondor_dir(build_paths, "out"),
+        "err": _dask_htcondor_dir(build_paths, "err"),
     }
+
+
+def _dask_htcondor_dir(build_paths: BuildPaths, kind: str) -> Path:
+    return build_paths.execution_backend_dir("dask", "htcondor", kind)
 
 
 def _htcondor_bootstrap_directives(paths: dict[str, Path]) -> dict[str, str]:

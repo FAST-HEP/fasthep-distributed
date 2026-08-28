@@ -1,4 +1,5 @@
 registry:
   backends:
     dask:
+      spec: fasthep_distributed._dask._spec:DASK_BACKEND_SPEC
       impl: fasthep_distributed._dask._common:DaskBackend

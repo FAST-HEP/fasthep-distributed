@@ -17,6 +17,7 @@ from fasthep_distributed._dask._common import (
     normalise_dask_strategy,
     validate_supported_dask_pools,
 )
+from fasthep_distributed._dask._spec import DASK_BACKEND_SPEC
 
 
 def test_compute_with_client_uses_client_compute_and_gather() -> None:
@@ -54,6 +55,28 @@ def test_dask_unsupported_strategy_errors_clearly() -> None:
         match=r"Dask strategy 'pbs' is not implemented yet\.",
     ):
         normalise_dask_strategy({"backend": "dask", "strategy": "pbs"})
+
+
+def test_dask_backend_spec_validates_strategy() -> None:
+    assert DASK_BACKEND_SPEC.validate_execution is not None
+
+    DASK_BACKEND_SPEC.validate_execution({"backend": "dask", "strategy": "htcondor"})
+
+    with pytest.raises(
+        ValueError,
+        match=r"Dask strategy 'pbs' is not implemented yet\.",
+    ):
+        DASK_BACKEND_SPEC.validate_execution({"backend": "dask", "strategy": "pbs"})
+
+
+def test_dask_backend_spec_declares_previous_build_layout() -> None:
+    assert DASK_BACKEND_SPEC.build_directories == (
+        "execution/dask/htcondor/submit",
+        "execution/dask/htcondor/logs",
+        "execution/dask/htcondor/out",
+        "execution/dask/htcondor/err",
+        "debug/dask",
+    )
 
 
 def test_normalise_dask_config_preserves_empty_config_defaults() -> None:
