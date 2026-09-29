@@ -21,6 +21,8 @@ from hepflow.build_layout import BuildPaths
 from hepflow.model.worker_environment import worker_environment_plan_from_execution
 from hepflow.utils import write_json
 
+from fasthep_distributed.probe._worker import installed_package_records, vcs_state
+
 DISTRIBUTED_PREPARATION_PHASE = "Preparing distributed execution"
 
 
@@ -799,71 +801,6 @@ def required_fasthep_imports(
     imports = {"distributed", "hepflow"}
     imports.update(_import_name_for_distribution(name) for name in names)
     return sorted(imports)
-
-
-def installed_package_records(prefix: Path) -> list[dict[str, Any]]:
-    site_packages = Path(
-        sysconfig.get_path(
-            "purelib",
-            vars={
-                "base": str(prefix),
-                "platbase": str(prefix),
-            },
-        )
-    )
-    records: list[dict[str, Any]] = []
-    for dist in metadata.distributions(path=[str(site_packages)]):
-        name = dist.metadata.get("Name")
-        if not name:
-            continue
-        direct_url_text = dist.read_text("direct_url.json")
-        editable = False
-        if direct_url_text:
-            try:
-                direct_url = json.loads(direct_url_text)
-            except json.JSONDecodeError:
-                direct_url = {}
-            editable = bool(direct_url.get("dir_info", {}).get("editable"))
-        records.append(
-            {
-                "name": name,
-                "version": dist.version,
-                "editable": editable,
-            }
-        )
-    return sorted(records, key=lambda item: str(item["name"]).lower())
-
-
-def vcs_state(source_path: Path) -> dict[str, Any] | None:
-    try:
-        root = subprocess.run(
-            ["git", "-C", str(source_path), "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    try:
-        revision = subprocess.run(
-            ["git", "-C", str(source_path), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "-C", str(source_path), "status", "--porcelain"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return {"root": root, "revision": None, "dirty": None}
-    return {
-        "root": root,
-        "revision": revision,
-        "dirty": bool(status.strip()),
-    }
 
 
 def _import_smoke_code(imports: list[str]) -> str:

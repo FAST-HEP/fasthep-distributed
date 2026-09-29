@@ -9,5 +9,6 @@ backends are not implemented here yet.
 ```{toctree}
 :maxdepth: 2
 
+probe
 development
 ```

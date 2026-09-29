@@ -29,6 +29,7 @@ dependencies = [
     "dask-jobqueue",
     "distributed",
     "fasthep-flow >=2026.8.4.dev0",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
