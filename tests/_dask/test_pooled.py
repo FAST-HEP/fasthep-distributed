@@ -15,6 +15,7 @@ from hepflow.build_layout import BuildPaths
 
 from fasthep_distributed._dask._pooled import (
     DaskPooledCluster,
+    DaskPooledHTCondorCluster,
     normalize_pooled_worker_pools,
 )
 from fasthep_distributed._dask._worker_env import (
@@ -1042,3 +1043,35 @@ def _pool_config() -> dict[str, dict[str, Any]]:
             },
         },
     }
+
+
+def _htcondor_job_script(tmp_path: Path, **kwargs: Any) -> str:
+    pytest.importorskip("dask_jobqueue")
+    job_cls = DaskPooledHTCondorCluster.resolve_job_cls()
+    job = job_cls(
+        scheduler="tcp://127.0.0.1:8786",
+        name="worker-0",
+        cores=1,
+        memory="2GB",
+        disk="1GB",
+        log_directory=str(tmp_path / "logs"),
+        **kwargs,
+    )
+    return cast("str", job.job_script())
+
+
+def test_htcondor_job_script_does_not_stream_output(tmp_path: Path) -> None:
+    script = _htcondor_job_script(tmp_path)
+
+    assert "stream_" not in script.lower()
+    assert f"LogDirectory = {tmp_path / 'logs'}" in script
+    assert "Output = $(LogDirectory)/worker-" in script
+
+
+def test_htcondor_job_script_streaming_is_explicit_opt_in(tmp_path: Path) -> None:
+    script = _htcondor_job_script(
+        tmp_path, job_extra_directives={"Stream_Output": "True"}
+    )
+
+    assert "Stream_Output = True" in script
+    assert "stream_error" not in script.lower()

@@ -949,8 +949,6 @@ def build_htcondor_worker_environment_job_kwargs(
                 (log_paths["err"] / "worker-$(ClusterId).$(ProcId).err").resolve()
             ),
             "Log": str((log_paths["logs"] / "worker-$(ClusterId).log").resolve()),
-            "Stream_Output": "True",
-            "Stream_Error": "True",
         },
         "job_script_prologue": list(env.prologue),
     }

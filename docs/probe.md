@@ -32,7 +32,7 @@ probe_root: /shared/path/build/probes  # submit files and logs go here
 lockfile: /shared/path/pixi.lock       # optional; recorded by sha256
 imports:
   required: [hepflow, fasthep_distributed, distributed]
-  optional: [fasthep]
+  optional: [uproot]
 paths:
   - {name: work, path: /shared/path}
   - {name: data, path: /data/user, required: false}

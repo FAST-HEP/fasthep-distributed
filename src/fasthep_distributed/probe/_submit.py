@@ -187,8 +187,8 @@ def render_submit_description(config: ProbeConfig, probe_dir: Path) -> str:
         "output = stdout.$(ProcId).json",
         "error = stderr.$(ProcId).log",
         f"log = {CONDOR_LOG_FILE}",
-        "stream_output = True",
-        "stream_error = True",
+        # No stream_output/stream_error: CERN's schedds reject them since
+        # November 2025. stdout and stderr are transferred back on exit.
         f"request_cpus = {condor.request_cpus}",
         f"request_memory = {condor.request_memory}",
     ]

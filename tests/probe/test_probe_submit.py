@@ -150,8 +150,7 @@ def test_submit_description_preserves_invariants(tmp_path: Path) -> None:
     assert "output = stdout.$(ProcId).json" in lines
     assert "error = stderr.$(ProcId).log" in lines
     assert "log = condor.log" in lines
-    assert "stream_output = True" in lines
-    assert "stream_error = True" in lines
+    assert not any(line.lower().startswith("stream_") for line in lines)
     assert "request_disk = 1GB" in lines
     assert '+JobFlavour = "espresso"' in lines
     assert '+AccountingGroup = "group_u_CMS.u_zh"' in lines

@@ -29,8 +29,6 @@ MISSING_DASK_JOBQUEUE_MESSAGE = (
 _HTCONDOR_FIXED_DIRECTIVES = {
     "transfer_executable": "False",
     "transfer_output_files": '""',
-    "Stream_Output": "True",
-    "Stream_Error": "True",
 }
 _HTCONDOR_RUNTIME_DIRECTIVES = {"Output", "Error", "Log"}
 

@@ -27,8 +27,6 @@ def _bootstrap_directives(**extra: Any) -> dict[str, Any]:
     return {
         "transfer_executable": "False",
         "transfer_output_files": '""',
-        "Stream_Output": "True",
-        "Stream_Error": "True",
         **extra,
     }
 

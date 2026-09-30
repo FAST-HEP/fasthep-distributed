@@ -14,6 +14,13 @@ from distributed.utils import NoOpAwaitable
 
 from fasthep_distributed._dask._pools import dask_worker_resource_args
 
+# dask-jobqueue enables stdout/stderr streaming whenever log_directory is set.
+# Streaming loads the schedd and shared filesystem, and some sites (CERN since
+# November 2025) reject submissions that request it. Output is transferred on
+# job exit instead; sites that allow streaming can opt in through
+# job_extra_directives.
+HTCONDOR_STREAMING_DIRECTIVES = ("Stream_Output", "Stream_Error")
+
 
 @dataclass(slots=True, frozen=True)
 class DaskPooledWorkerPool:
@@ -192,6 +199,13 @@ class DaskPooledHTCondorCluster(DaskPooledCluster):
                     Path(submit_directory) if submit_directory is not None else None
                 )
                 super().__init__(*args, **kwargs)
+                requested = {
+                    str(key).lower()
+                    for key in (kwargs.get("job_extra_directives") or {})
+                }
+                for key in HTCONDOR_STREAMING_DIRECTIVES:
+                    if key.lower() not in requested:
+                        self.job_header_dict.pop(key, None)
 
             @contextmanager
             def job_file(self) -> Any:

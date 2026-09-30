@@ -74,8 +74,12 @@ It does not own backend-neutral workflow semantics:
   should pass file paths to scheduler transfer and set worker environment
   variables in the job prologue.
 - HTCondOR transfer file basenames must be unique. Preserve invariants such as
-  `transfer_executable=False`, empty `transfer_output_files`, streamed stdout
-  and stderr, and Flow-controlled `Output`, `Error` and `Log` paths.
+  `transfer_executable=False`, empty `transfer_output_files`, and
+  Flow-controlled `Output`, `Error` and `Log` paths.
+- Do not stream HTCondor stdout/stderr by default. dask-jobqueue adds
+  `Stream_Output`/`Stream_Error` when `log_directory` is set; the FAST-HEP job
+  class removes them unless requested in `job_extra_directives`. CERN schedds
+  reject streaming since November 2025.
 - Scheduler-specific options are site-sensitive. Validate queue/flavour,
   walltime, disk, memory, GPU and log-directory behavior against the scheduler
   adapter rather than assuming another scheduler's vocabulary.
