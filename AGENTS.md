@@ -67,6 +67,13 @@ It does not own backend-neutral workflow semantics:
 - Packed Pixi prefix mode currently resolves `source='current'`, packs the
   active prefix with `conda-pack`, validates imports before submit, and records
   manifests under Flow build paths.
+- `execution.environment.type: shared-prefix` runs workers from the absolute
+  `bin/python` of an existing prefix (`prefix:` path or `current`) on a shared
+  filesystem such as AFS. Nothing is packed or transferred; it requires
+  staging mode `shared`. Preparation fails before submit if the prefix is
+  missing, node-local (`/tmp`, ...) or cannot import the worker packages, and
+  the manifest records editable sources with git revision and dirty state.
+  Do not change the prefix or its editable sources while workers run.
 - Staging mode `shared` assumes workers can see shared paths. Staging mode
   `transfer` creates transfer inputs such as `compile.tar.gz`, `prefix.tar.gz`,
   `bootstrap.sh` and optional `editable-snapshot.tar.gz`.
