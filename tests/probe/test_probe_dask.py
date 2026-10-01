@@ -199,14 +199,14 @@ def test_summary_flags_port_range_and_missing_logs() -> None:
                 "task": {"report": {"summary": {"verdict": "pass"}}},
             }
         ],
-        "condor": {"jobs": [{"job_id": "4242", "stdout_returned": False}]},
+        "condor": {"jobs": [{"job_id": "4242.0", "stderr_returned": False}]},
     }
 
     summary = dask_probe.summarise_dask_report(report)
 
     assert summary["verdict"] == "fail"
     assert summary["failed_required"] == ["worker.default-0.port_range"]
-    assert summary["warnings"] == ["job.4242.stdout_missing"]
+    assert summary["warnings"] == ["job.4242.0.worker_log_missing"]
 
 
 def test_condor_facts_read_jobqueue_logs(tmp_path: Path) -> None:
@@ -214,8 +214,11 @@ def test_condor_facts_read_jobqueue_logs(tmp_path: Path) -> None:
     base = tmp_path / "execution" / "dask" / "htcondor"
     for kind in ("logs", "out", "err"):
         (base / kind).mkdir(parents=True)
+    # Queue items of one submit share a cluster id and a log, with sub-ids 0, 1.
     (base / "logs" / "worker-4242.log").write_text(
         "000 (4242.000.000) 2026-10-01 10:00:00 Job submitted from host: <x>\n"
+        "...\n"
+        "000 (4242.001.000) 2026-10-01 10:00:00 Job submitted from host: <x>\n"
         "...\n"
         "001 (4242.000.000) 2026-10-01 10:01:10 Job executing on host: <y>\n"
         "...\n"
@@ -226,15 +229,20 @@ def test_condor_facts_read_jobqueue_logs(tmp_path: Path) -> None:
     )
     (base / "out" / "worker-4242.0.out").write_text("worker log\n", encoding="utf-8")
 
-    facts = dask_probe._condor_facts(build_paths, [{"job_id": "4242"}])
+    # jobqueue reports "<cluster>.<proc>"; a bare cluster id expands the same way.
+    for reported in ("4242.0", "4242"):
+        facts = dask_probe._condor_facts(build_paths, [{"job_id": reported}])
 
-    [job] = facts["jobs"]
-    assert job["state"] == "terminated"
-    assert job["return_value"] == 0
-    assert job["times"] == {
-        "submitted": "2026-10-01 10:00:00",
-        "running": "2026-10-01 10:01:10",
-        "terminated": "2026-10-01 10:02:00",
-    }
-    assert job["stdout_returned"] is True
-    assert job["stderr_returned"] is False
+        first, second = facts["jobs"]
+        assert (first["job_id"], second["job_id"]) == ("4242.0", "4242.1")
+        assert first["state"] == "terminated"
+        assert first["return_value"] == 0
+        assert first["times"] == {
+            "submitted": "2026-10-01 10:00:00",
+            "running": "2026-10-01 10:01:10",
+            "terminated": "2026-10-01 10:02:00",
+        }
+        assert first["stdout_returned"] is True
+        assert first["stderr_returned"] is False
+        assert second["state"] == "submitted"
+        assert second["stdout_returned"] is False

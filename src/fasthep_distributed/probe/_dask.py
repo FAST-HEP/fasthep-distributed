@@ -106,6 +106,11 @@ def run_dask_probe(
                     timeout=config.dask.task_timeout + 60
                 )
             report["timings"]["tasks_s"] = _elapsed(task_started)
+            # Results are copied into the records. Release them on the workers,
+            # otherwise retire_workers refuses ("unique data could not be
+            # moved") and the jobs only end through condor_rm, which returns no
+            # stdout/stderr.
+            client.cancel(list(futures.values()))
             retire_started = time.monotonic()
             report["shutdown"] = _retire_workers(
                 client,
@@ -220,8 +225,9 @@ def summarise_dask_report(report: dict[str, Any]) -> dict[str, Any]:
         if record.get("port_in_range") is False:
             failed.append(f"worker.{name}.port_range")
     for job in (report.get("condor") or {}).get("jobs", []):
-        if not job.get("stdout_returned"):
-            warnings.append(f"job.{job.get('job_id')}.stdout_missing")
+        # The Dask worker logs to stderr; an empty stdout is normal.
+        if not job.get("stderr_returned"):
+            warnings.append(f"job.{job.get('job_id')}.worker_log_missing")
     return {
         "verdict": FAIL if failed else PASS,
         "failed_required": failed,
@@ -257,7 +263,8 @@ def format_dask_report(report: dict[str, Any]) -> str:
     for job in (report.get("condor") or {}).get("jobs", []):
         lines.append(
             f"condor job {job.get('job_id')}: {job.get('state')}  "
-            f"times: {job.get('times')}  stdout returned: {job.get('stdout_returned')}"
+            f"times: {job.get('times')}  worker log returned: "
+            f"{job.get('stderr_returned')}"
         )
     shutdown = report.get("shutdown") or {}
     if shutdown:
@@ -335,7 +342,10 @@ def _retire_workers(
     except Exception as exc:
         shutdown["error"] = f"{type(exc).__name__}: {exc}"
         return shutdown
-    job_ids = [str(record["job_id"]) for record in workers if record.get("job_id")]
+    job_ids = sorted(
+        _job_ids(logs_dir, [r["job_id"] for r in workers if r.get("job_id")]),
+        key=_job_sort_key,
+    )
     deadline = time.monotonic() + grace
     while True:
         if job_ids and all(
@@ -356,14 +366,15 @@ def _condor_facts(build_paths: Any, workers: list[dict[str, Any]]) -> dict[str, 
 
     paths = _htcondor_execution_paths(build_paths)
     job_ids = sorted(
-        {str(record["job_id"]) for record in workers if record.get("job_id")}
-        | _job_ids_from_logs(paths["logs"])
+        _job_ids(paths["logs"], [r["job_id"] for r in workers if r.get("job_id")]),
+        key=_job_sort_key,
     )
     jobs = []
     for job_id in job_ids:
+        cluster, proc = _split_job_id(job_id)
         state = _job_state_record(paths["logs"], job_id)
-        stdout = paths["out"] / f"worker-{job_id}.0.out"
-        stderr = paths["err"] / f"worker-{job_id}.0.err"
+        stdout = paths["out"] / f"worker-{cluster}.{proc}.out"
+        stderr = paths["err"] / f"worker-{cluster}.{proc}.err"
         jobs.append(
             {
                 "job_id": job_id,
@@ -378,7 +389,50 @@ def _condor_facts(build_paths: Any, workers: list[dict[str, Any]]) -> dict[str, 
     return {"jobs": jobs, "paths": {key: str(value) for key, value in paths.items()}}
 
 
-def _job_ids_from_logs(logs_dir: Path) -> set[str]:
+def _split_job_id(job_id: str) -> tuple[str, str]:
+    """Split ``<cluster>.<proc>``; HTCondor numbers the queue items of one submit."""
+
+    cluster, _, proc = str(job_id).partition(".")
+    return cluster, proc or "0"
+
+
+def _job_sort_key(job_id: str) -> tuple[int, int]:
+    cluster, proc = _split_job_id(job_id)
+    return (
+        int(cluster) if cluster.isdigit() else 0,
+        int(proc) if proc.isdigit() else 0,
+    )
+
+
+def _job_ids(logs_dir: Path, reported: list[Any]) -> set[str]:
+    """
+    All ``<cluster>.<proc>`` ids of the cluster's jobs.
+
+    Ids reported by the cluster are used as they are; a bare cluster id (and
+    each cluster found in the Condor logs) expands to every process in its log.
+    """
+
+    ids: set[str] = set()
+    clusters: set[str] = set()
+    for job_id in reported:
+        cluster, _, proc = str(job_id).partition(".")
+        if proc:
+            ids.add(f"{cluster}.{proc}")
+        clusters.add(cluster)
+    clusters |= _clusters_from_logs(logs_dir)
+    for cluster in clusters:
+        if not cluster.isdigit():
+            continue
+        states = parse_condor_log(
+            logs_dir / f"worker-{cluster}.log", cluster=int(cluster)
+        )
+        ids.update(f"{cluster}.{proc}" for proc in states)
+        if not states and not any(i.startswith(f"{cluster}.") for i in ids):
+            ids.add(f"{cluster}.0")
+    return ids
+
+
+def _clusters_from_logs(logs_dir: Path) -> set[str]:
     if not logs_dir.is_dir():
         return set()
     return {
@@ -389,11 +443,11 @@ def _job_ids_from_logs(logs_dir: Path) -> set[str]:
 
 
 def _job_state_record(logs_dir: Path, job_id: str) -> Any:
-    cluster = job_id.split(".", maxsplit=1)[0]
-    if not cluster.isdigit():
+    cluster, proc = _split_job_id(job_id)
+    if not cluster.isdigit() or not proc.isdigit():
         return None
     states = parse_condor_log(logs_dir / f"worker-{cluster}.log", cluster=int(cluster))
-    return states.get(0)
+    return states.get(int(proc))
 
 
 def _job_state(logs_dir: Path, job_id: str) -> str:
