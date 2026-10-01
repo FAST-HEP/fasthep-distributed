@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from ._config import ProbeConfigError, load_probe_config
+from ._dask import format_dask_report, run_dask_probe
 from ._report import collect_probe, format_collection
 from ._submit import ProbeBundle, ProbeError, prepare_probe, submit_probe
 from ._worker import PASS
@@ -25,6 +26,11 @@ def main(argv: list[str] | None = None) -> int:
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, type=Path)
+    dask = commands.add_parser(
+        "dask",
+        help="start HTCondor Dask workers and run the checks as Dask tasks",
+    )
+    dask.add_argument("--config", required=True, type=Path)
     collect = commands.add_parser("collect", help="summarise a submitted probe")
     collect.add_argument("probe_dir", type=Path)
     collect.add_argument("--json", action="store_true", help="print JSON")
@@ -39,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(format_collection(collection))
             return 0 if collection.verdict == PASS else 1
 
+        if args.command == "dask":
+            report = run_dask_probe(load_probe_config(args.config))
+            sys.stdout.write(format_dask_report(report))
+            return 0 if report["summary"]["verdict"] == PASS else 1
+
         bundle = prepare_probe(load_probe_config(args.config))
         _write_prepared(bundle)
         if args.command == "submit":
@@ -48,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"collect with: python -m fasthep_distributed.probe collect "
                 f"{result.probe_dir}\n"
             )
-    except (ProbeConfigError, ProbeError) as exc:
+    except (ProbeConfigError, ProbeError, ValueError) as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 2
     return 0

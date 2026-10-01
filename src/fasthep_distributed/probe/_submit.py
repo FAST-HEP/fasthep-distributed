@@ -70,23 +70,9 @@ def prepare_probe(
     execution.
     """
 
-    _validate_prefix(config)
-    probe_id = make_probe_id(now=now, runner=runner)
-    probe_dir = _create_probe_dir(config.probe_root, probe_id)
-
-    shutil.copy2(WORKER_SCRIPT, probe_dir / WORKER_FILE)
-    _write_json(probe_dir / CONFIG_FILE, config.worker_config(probe_id))
-
-    submit_facts = _collect_submit_facts(config, probe_dir, runner=runner)
-    submit_facts["submit_context"] = submit_context(config, runner=runner)
-    _write_json(probe_dir / SUBMIT_FACTS_FILE, submit_facts)
-    failed = submit_facts.get("summary", {}).get("failed_required", [])
-    if failed:
-        raise ProbeError(
-            f"Required checks failed on the submit host: {', '.join(failed)}. "
-            f"See {probe_dir / SUBMIT_FACTS_FILE}"
-        )
-
+    probe_id, probe_dir, submit_facts = prepare_probe_dir(
+        config, now=now, runner=runner
+    )
     executable = probe_dir / EXECUTABLE_FILE
     executable.write_text(
         render_executable(prefix=config.prefix, probe_id=probe_id),
@@ -106,6 +92,37 @@ def prepare_probe(
         submit_facts=submit_facts,
         count=config.condor.count,
     )
+
+
+def prepare_probe_dir(
+    config: ProbeConfig,
+    *,
+    now: datetime | None = None,
+    runner: Runner = subprocess.run,
+) -> tuple[str, Path, dict[str, Any]]:
+    """
+    Create a probe directory with the worker script, config and submit facts.
+
+    Fails if a required check already fails on the submit host.
+    """
+
+    _validate_prefix(config)
+    probe_id = make_probe_id(now=now, runner=runner)
+    probe_dir = _create_probe_dir(config.probe_root, probe_id)
+
+    shutil.copy2(WORKER_SCRIPT, probe_dir / WORKER_FILE)
+    _write_json(probe_dir / CONFIG_FILE, config.worker_config(probe_id))
+
+    submit_facts = _collect_submit_facts(config, probe_dir, runner=runner)
+    submit_facts["submit_context"] = submit_context(config, runner=runner)
+    _write_json(probe_dir / SUBMIT_FACTS_FILE, submit_facts)
+    failed = submit_facts.get("summary", {}).get("failed_required", [])
+    if failed:
+        raise ProbeError(
+            f"Required checks failed on the submit host: {', '.join(failed)}. "
+            f"See {probe_dir / SUBMIT_FACTS_FILE}"
+        )
+    return probe_id, probe_dir, submit_facts
 
 
 def submit_probe(

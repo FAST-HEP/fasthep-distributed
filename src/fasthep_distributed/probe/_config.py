@@ -24,7 +24,9 @@ _TOP_LEVEL_KEYS = {
     "condor",
     "submit_dir",
     "timeouts",
+    "dask",
 }
+_DASK_KEYS = {"use", "execution", "retire_grace", "task_timeout"}
 _CONDOR_KEYS = {
     "flavour",
     "request_cpus",
@@ -57,6 +59,23 @@ class CondorSpec:
 
 
 @dataclass(slots=True, frozen=True)
+class DaskProbeSpec:
+    """
+    Dask probe settings.
+
+    ``use`` and ``execution`` have the same meaning as in a workflow and are
+    resolved by Flow, so the probe accepts site profiles such as
+    ``fasthep_distributed:dask_htcondor_cern``.
+    """
+
+    use: dict[str, Any] = field(default_factory=dict)
+    execution: dict[str, Any] = field(default_factory=dict)
+    base_dir: Path = field(default_factory=Path.cwd)
+    retire_grace: float = 120.0
+    task_timeout: float = 900.0
+
+
+@dataclass(slots=True, frozen=True)
 class ProbeConfig:
     prefix: Path
     probe_root: Path
@@ -68,6 +87,7 @@ class ProbeConfig:
     forbidden_submit_prefixes: tuple[str, ...] = DEFAULT_FORBIDDEN_SUBMIT_PREFIXES
     required_submit_prefix: str | None = None
     timeouts: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_TIMEOUTS))
+    dask: DaskProbeSpec | None = None
 
     @property
     def python(self) -> Path:
@@ -170,6 +190,35 @@ def probe_config_from_mapping(
         forbidden_submit_prefixes=forbidden,
         required_submit_prefix=required_prefix,
         timeouts=_timeouts(raw.get("timeouts") or {}),
+        dask=_dask_spec(raw.get("dask"), base),
+    )
+
+
+def _dask_spec(raw: Any, base: Path) -> DaskProbeSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ProbeConfigError("'dask' must be a mapping")
+    _reject_unknown(raw, _DASK_KEYS, "dask")
+    use = raw.get("use", {})
+    execution = raw.get("execution", {})
+    if not isinstance(use, Mapping):
+        raise ProbeConfigError("'dask.use' must be a mapping")
+    if not isinstance(execution, Mapping):
+        raise ProbeConfigError("'dask.execution' must be a mapping")
+    defaults = DaskProbeSpec()
+    values: dict[str, float] = {}
+    for key in ("retire_grace", "task_timeout"):
+        value = raw.get(key, getattr(defaults, key))
+        if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
+            raise ProbeConfigError(f"'dask.{key}' must be a non-negative number")
+        values[key] = float(value)
+    return DaskProbeSpec(
+        use=dict(use),
+        execution=dict(execution),
+        base_dir=base,
+        retire_grace=values["retire_grace"],
+        task_timeout=values["task_timeout"],
     )
 
 

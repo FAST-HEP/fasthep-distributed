@@ -9,7 +9,7 @@ from typing import Any
 from ._submit import CONDOR_LOG_FILE, SUBMIT_RECORD_FILE
 from ._worker import FAIL, PASS
 
-_EVENT_PATTERN = re.compile(r"^(\d{3}) \((\d+)\.(\d+)\.\d+\)")
+_EVENT_PATTERN = re.compile(r"^(\d{3}) \((\d+)\.(\d+)\.\d+\) (\S+ \S+)")
 _RETURN_VALUE_PATTERN = re.compile(r"return value (-?\d+)")
 _SIGNAL_PATTERN = re.compile(r"signal (\d+)")
 
@@ -29,6 +29,8 @@ class CondorJobState:
     state: str = "unknown"
     return_value: int | None = None
     detail: str | None = None
+    # First timestamp of each state, as written in the event log.
+    times: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -135,10 +137,15 @@ def parse_condor_log(path: Path, *, cluster: int) -> dict[int, CondorJobState]:
         match = _EVENT_PATTERN.match(line)
         if match is not None:
             current = None
-            code, event_cluster, process = match.groups()
+            code, event_cluster, process, timestamp = match.groups()
             if int(event_cluster) != cluster or code not in _EVENT_STATES:
                 continue
-            current = CondorJobState(state=_EVENT_STATES[code])
+            previous = states.get(int(process))
+            current = CondorJobState(
+                state=_EVENT_STATES[code],
+                times=dict(previous.times) if previous else {},
+            )
+            current.times.setdefault(current.state, timestamp)
             states[int(process)] = current
             continue
         if current is None or line.strip() in {"", "..."}:
