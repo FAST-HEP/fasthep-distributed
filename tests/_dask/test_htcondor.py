@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import sys
 import types
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 from hepflow.build_layout import BuildPaths
+from hepflow.compiler.profiles import load_profile_config
 from hepflow.model.plan import ExecutionPlan
 from hepflow.progress import ProgressReporter, ProgressUpdate
 from hepflow.runtime.config import _runtime_execution_with_overrides
@@ -17,9 +19,12 @@ from fasthep_distributed._dask._htcondor import (
     MISSING_DASK_JOBQUEUE_MESSAGE,
     _prepare_htcondor_pool_specs,
     _wait_for_htcondor_workers,
+    check_scheduler_port,
     compute_with_htcondor,
     normalize_dask_htcondor_config,
+    resolve_scheduler_options,
 )
+from fasthep_distributed._dask._pooled import DaskPooledHTCondorCluster
 from fasthep_distributed._dask._worker_env import PreparedWorkerEnvironment
 
 
@@ -267,8 +272,11 @@ def test_htcondor_cluster_scales_workers_and_computes_tasks(
     calls: dict[str, Any] = {}
 
     class FakePooledHTCondorCluster:
-        def __init__(self, *, pools: dict[str, Any]) -> None:
+        def __init__(
+            self, *, pools: dict[str, Any], scheduler_options: dict[str, Any]
+        ) -> None:
             calls["pools"] = pools
+            calls["scheduler_options"] = scheduler_options
             calls["cluster"] = self
             self.scaled_to: dict[str, int] | None = None
             self.closed = False
@@ -328,6 +336,7 @@ def test_htcondor_cluster_scales_workers_and_computes_tasks(
     assert config["worker_start_timeout"] == 120
     assert calls["wait_for_workers"] == (3, 120)
     assert calls["cluster"].scaled_to == {"default": 3}
+    assert calls["scheduler_options"] == {}
     assert calls["cluster"].closed is True
     assert calls["client_closed"] is True
     job_kwargs = calls["pools"]["default"]["job_kwargs"]
@@ -411,7 +420,9 @@ def test_htcondor_timeout_closes_client_and_cluster(
     calls: dict[str, Any] = {}
 
     class FakePooledHTCondorCluster:
-        def __init__(self, *, pools: dict[str, Any]) -> None:
+        def __init__(
+            self, *, pools: dict[str, Any], scheduler_options: dict[str, Any]
+        ) -> None:
             calls["cluster"] = self
             self.closed = False
 
@@ -883,3 +894,153 @@ def _htcondor_execution(*, staging: str = "shared") -> dict[str, Any]:
     if staging != "shared":
         execution["staging"] = {"mode": staging}
     return execution
+
+
+def _default_pool_options(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_dask_htcondor_config(
+        {
+            "backend": "dask",
+            "strategy": "htcondor",
+            "resources": {"default": {"cpus": 1, "memory": "2GB"}},
+            "config": config,
+        }
+    )
+    return cast("dict[str, Any]", normalized["pool_specs"]["default"]["job_kwargs"])
+
+
+def test_htcondor_site_directives_merge_under_user_directives() -> None:
+    options = _default_pool_options(
+        {
+            "site_directives": {"MY.IsDaskWorker": "true", "JobBatchName": '"site"'},
+            "job_extra_directives": {"JobBatchName": '"mine"'},
+        }
+    )
+
+    directives = options["job_extra_directives"]
+    assert directives["MY.IsDaskWorker"] == "true"
+    assert directives["JobBatchName"] == '"mine"'
+    assert directives["transfer_executable"] == "False"
+
+
+def test_htcondor_site_directives_cannot_override_invariants() -> None:
+    with pytest.raises(ValueError, match="site_directives cannot override"):
+        _default_pool_options({"site_directives": {"transfer_executable": "True"}})
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {"worker_port_range": "10000:10100"},
+            ["--worker-port", "10000:10100", "--nanny-port", "10000:10100"],
+        ),
+        (
+            {"worker_port_range": "10000:10100", "nanny": False},
+            ["--worker-port", "10000:10100"],
+        ),
+        ({"worker_port_range": 10000}, ["--worker-port", "10000", "--nanny-port", "10000"]),
+    ],
+)
+def test_htcondor_worker_port_range(config: dict[str, Any], expected: list[str]) -> None:
+    options = _default_pool_options(
+        {**config, "worker_extra_args": ["--lifetime", "1h"]}
+    )
+
+    assert options["worker_extra_args"][:2] == ["--lifetime", "1h"]
+    assert options["worker_extra_args"][2 : 2 + len(expected)] == expected
+
+
+@pytest.mark.parametrize("value", ["10100:10000", "a:b", "1:2:3", "0", True, "70000"])
+def test_htcondor_invalid_worker_port_range(value: Any) -> None:
+    with pytest.raises(ValueError, match="worker_port_range"):
+        _default_pool_options({"worker_port_range": value})
+
+
+def test_htcondor_nanny_and_submit_command_extra() -> None:
+    options = _default_pool_options({"nanny": False, "submit_command_extra": ["-spool"]})
+
+    assert options["nanny"] is False
+    assert options["submit_command_extra"] == ["-spool"]
+    with pytest.raises(ValueError, match="nanny must be a boolean"):
+        _default_pool_options({"nanny": "no"})
+    with pytest.raises(ValueError, match="submit_command_extra"):
+        _default_pool_options({"submit_command_extra": "-spool"})
+
+
+def test_htcondor_scheduler_options_are_validated_and_resolved() -> None:
+    config = normalize_dask_htcondor_config(
+        {
+            "backend": "dask",
+            "strategy": "htcondor",
+            "config": {"scheduler_options": {"host": "fqdn", "port": 8786}},
+        }
+    )
+
+    assert config["scheduler_options"] == {"host": "fqdn", "port": 8786}
+    resolved = resolve_scheduler_options(config["scheduler_options"])
+    assert resolved == {"host": socket.getfqdn(), "port": 8786}
+    for bad, message in (
+        ({"hostname": "x"}, "Unsupported"),
+        ({"port": "8786"}, "port number"),
+        ([], "must be a mapping"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            normalize_dask_htcondor_config(
+                {"backend": "dask", "config": {"scheduler_options": bad}}
+            )
+
+
+def test_check_scheduler_port_reports_busy_port() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen()
+        port = holder.getsockname()[1]
+
+        with pytest.raises(RuntimeError, match=f"port {port} is already in use"):
+            check_scheduler_port({"host": "127.0.0.1", "port": port})
+
+    check_scheduler_port({"host": "127.0.0.1", "port": 0})
+    check_scheduler_port({})
+
+
+def test_cern_profile_renders_cern_job_script(tmp_path: Path) -> None:
+    pytest.importorskip("dask_jobqueue")
+    profile = load_profile_config(
+        "fasthep_distributed:dask_htcondor_cern", project_root=tmp_path
+    )
+    execution = profile["execution"]
+    execution["resources"] = {"default": {"cpus": 1, "memory": "2GB", "disk": "1GB"}}
+    config = normalize_dask_htcondor_config(execution)
+    assert config["scheduler_options"] == {"host": "fqdn", "port": 8786}
+
+    job_cls = DaskPooledHTCondorCluster.resolve_job_cls()
+    job = job_cls(
+        scheduler="tcp://lxplus.example:8786",
+        name="default-0",
+        log_directory=str(tmp_path / "logs"),
+        **config["pool_specs"]["default"]["job_kwargs"],
+    )
+    script = job.job_script()
+
+    assert "MY.IsDaskWorker = true" in script
+    assert 'JobBatchName = "fasthep-dask-worker"' in script
+    assert "--worker-port 10000:10100" in script
+    assert "--nanny-port 10000:10100" in script
+    assert "--nanny " in script
+    assert "stream_" not in script.lower()
+
+
+def test_check_scheduler_port_ignores_time_wait() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        # Servers such as Dask's (tornado) listen with SO_REUSEADDR.
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port))
+        connection, _ = server.accept()
+        # The side that closes first ends up in TIME_WAIT on the server port.
+        connection.close()
+        client.close()
+
+    check_scheduler_port({"host": "127.0.0.1", "port": port})

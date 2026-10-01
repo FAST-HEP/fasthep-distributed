@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import errno
+import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +35,10 @@ _HTCONDOR_FIXED_DIRECTIVES = {
     "transfer_output_files": '""',
 }
 _HTCONDOR_RUNTIME_DIRECTIVES = {"Output", "Error", "Log"}
+_SCHEDULER_OPTION_KEYS = {"host", "port", "dashboard_address", "interface", "protocol"}
+# Sentinel resolved on the submit host when the cluster starts, so compiled
+# plans do not record a particular interactive node.
+SCHEDULER_HOST_FQDN = "fqdn"
 
 
 def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
@@ -50,6 +58,7 @@ def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
     return {
         "workers": first_pool.workers,
         "worker_start_timeout": _worker_start_timeout(config),
+        "scheduler_options": _scheduler_options(config),
         "cluster_options": first_options,
         "pool_specs": pool_specs,
         "scale": scale,
@@ -92,6 +101,31 @@ def compute_with_htcondor(
     build_paths: BuildPaths,
     progress: Any | None = None,
 ) -> tuple[list[Any], str | None, dict[str, Any]]:
+    with htcondor_client(
+        execution=execution,
+        build_paths=build_paths,
+        progress=progress,
+    ) as (client, htcondor_config):
+        if progress is not None:
+            progress.phase_started("executing")
+        results, dashboard_link = compute_with_client(client, tasks)
+        return results, dashboard_link, htcondor_config
+
+
+@contextmanager
+def htcondor_client(
+    *,
+    execution: dict[str, Any],
+    build_paths: BuildPaths,
+    progress: Any | None = None,
+) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """
+    Start HTCondor workers, wait for them, and yield a connected client.
+
+    Shared by plan execution and the Dask worker probe, so that the probe
+    exercises the production start-up path.
+    """
+
     try:
         import dask_jobqueue  # noqa: F401, PLC0415
     except ModuleNotFoundError as exc:
@@ -100,6 +134,8 @@ def compute_with_htcondor(
     from distributed import Client  # noqa: PLC0415
 
     htcondor_config = normalize_dask_htcondor_config(execution)
+    scheduler_options = resolve_scheduler_options(htcondor_config["scheduler_options"])
+    check_scheduler_port(scheduler_options)
     pool_specs = _prepare_htcondor_pool_specs(
         htcondor_config["pool_specs"],
         execution=execution,
@@ -107,7 +143,10 @@ def compute_with_htcondor(
         progress=progress,
     )
 
-    cluster = DaskPooledHTCondorCluster(pools=pool_specs)
+    cluster = DaskPooledHTCondorCluster(
+        pools=pool_specs,
+        scheduler_options=scheduler_options,
+    )
     client = Client(cluster)
     try:
         cluster.scale(htcondor_config["scale"])
@@ -118,13 +157,46 @@ def compute_with_htcondor(
             timeout=float(htcondor_config["worker_start_timeout"]),
             build_paths=build_paths,
         )
-        if progress is not None:
-            progress.phase_started("executing")
-        results, dashboard_link = compute_with_client(client, tasks)
-        return results, dashboard_link, htcondor_config
+        yield client, htcondor_config
     finally:
         client.close()
         cluster.close()
+
+
+def resolve_scheduler_options(options: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(options)
+    if resolved.get("host") == SCHEDULER_HOST_FQDN:
+        resolved["host"] = socket.getfqdn()
+    return resolved
+
+
+def check_scheduler_port(options: dict[str, Any]) -> None:
+    """
+    Fail before submitting workers if the fixed scheduler port is taken.
+
+    On shared interactive nodes (e.g. lxplus, port 8786) another user's
+    scheduler may already hold the port; ports are per node, not per user.
+    """
+
+    port = options.get("port")
+    if not port:
+        return
+    host = str(options.get("host") or "")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        # Like the scheduler's own listener: connections in TIME_WAIT from a
+        # previous run must not count as the port being in use.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, int(port)))
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            node = host or socket.getfqdn()
+            raise RuntimeError(
+                f"Dask scheduler port {port} is already in use on {node}. Only one "
+                "scheduler per node can use a fixed port; run from another node or "
+                "choose a different execution.config.scheduler_options.port."
+            ) from exc
 
 
 def _prepare_htcondor_pool_specs(
@@ -316,9 +388,38 @@ def _htcondor_cluster_options(
     if log_directory is not None:
         cluster_options["log_directory"] = log_directory
 
+    nanny = config.get("nanny")
+    if nanny is not None:
+        if not isinstance(nanny, bool):
+            raise ValueError("execution.config.nanny must be a boolean")
+        cluster_options["nanny"] = nanny
+
+    submit_command_extra = config.get("submit_command_extra")
+    if submit_command_extra is not None:
+        if not isinstance(submit_command_extra, list) or not all(
+            isinstance(item, str) for item in submit_command_extra
+        ):
+            raise ValueError(
+                "execution.config.submit_command_extra must be a list of strings"
+            )
+        cluster_options["submit_command_extra"] = list(submit_command_extra)
+
     job_extra_directives: dict[str, Any] = dict(_HTCONDOR_FIXED_DIRECTIVES)
     if config.get("queue") is not None:
         job_extra_directives["+JobFlavour"] = f'"{config["queue"]}"'
+    # Site-specific ClassAds (e.g. CERN's MY.IsDaskWorker) come from site
+    # profiles. They are kept apart from job_extra_directives so that a
+    # workflow setting its own directives does not drop them, since Flow merges
+    # execution.config only one level deep. User directives win on conflicts.
+    if config.get("site_directives") is not None:
+        site_directives = config["site_directives"]
+        if not isinstance(site_directives, dict):
+            raise ValueError("execution.config.site_directives must be a mapping")
+        job_extra_directives = _merge_htcondor_directives(
+            job_extra_directives,
+            site_directives,
+            "execution.config.site_directives",
+        )
     if config.get("job_extra_directives") is not None:
         raw_directives = config["job_extra_directives"]
         if not isinstance(raw_directives, dict):
@@ -334,6 +435,9 @@ def _htcondor_cluster_options(
         cluster_options["job_extra_directives"] = job_extra_directives
 
     worker_extra_args = _worker_extra_args(config.get("worker_extra_args"))
+    worker_extra_args.extend(
+        _worker_port_args(config.get("worker_port_range"), nanny=nanny is not False)
+    )
     worker_extra_args.extend(dask_worker_resource_args(dask_resources))
     if worker_extra_args:
         cluster_options["worker_extra_args"] = worker_extra_args
@@ -427,6 +531,56 @@ def _worker_extra_args(raw: Any) -> list[str]:
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
         raise ValueError("execution.config.worker_extra_args must be a list of strings")
     return list(raw)
+
+
+def _scheduler_options(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("scheduler_options")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("execution.config.scheduler_options must be a mapping")
+    unknown = sorted(str(key) for key in raw if key not in _SCHEDULER_OPTION_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unsupported execution.config.scheduler_options: " + ", ".join(unknown)
+        )
+    port = raw.get("port")
+    if port is not None and (
+        isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536
+    ):
+        raise ValueError(
+            "execution.config.scheduler_options.port must be a port number"
+        )
+    return dict(raw)
+
+
+def _worker_port_args(raw: Any, *, nanny: bool) -> list[str]:
+    """
+    Render a site's open port range for the worker and, if enabled, its nanny.
+
+    Kept as a dedicated option so that a workflow's own worker_extra_args do not
+    replace the range set by a site profile.
+    """
+
+    if raw is None:
+        return []
+    port_range = str(raw)
+    bounds = port_range.split(":")
+    if (
+        isinstance(raw, bool)
+        or len(bounds) > 2
+        or not all(item.isdigit() for item in bounds)
+        or not all(0 < int(item) < 65536 for item in bounds)
+        or (len(bounds) == 2 and int(bounds[0]) > int(bounds[1]))
+    ):
+        raise ValueError(
+            "execution.config.worker_port_range must be a port or a range "
+            f"'low:high', got {raw!r}"
+        )
+    args = ["--worker-port", port_range]
+    if nanny:
+        args.extend(["--nanny-port", port_range])
+    return args
 
 
 def _pool_summary(pool: DaskWorkerPool) -> dict[str, Any]:
