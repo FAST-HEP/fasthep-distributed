@@ -339,6 +339,8 @@ def test_htcondor_cluster_scales_workers_and_computes_tasks(
     assert calls["scheduler_options"] == {}
     assert calls["cluster"].closed is True
     assert calls["client_closed"] is True
+    assert config["worker_shutdown_grace"] == 120.0
+    assert config["shutdown"]["jobs_exited"] is True
     job_kwargs = calls["pools"]["default"]["job_kwargs"]
     assert job_kwargs["cores"] == 2
     assert job_kwargs["memory"] == "8GB"

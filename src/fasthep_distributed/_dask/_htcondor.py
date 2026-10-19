@@ -10,6 +10,11 @@ from typing import Any
 from hepflow.build_layout import BuildPaths
 
 from fasthep_distributed._dask._common import compute_with_client
+from fasthep_distributed._dask._htcondor_shutdown import (
+    DEFAULT_WORKER_SHUTDOWN_GRACE,
+    cluster_job_ids,
+    shutdown_htcondor_workers,
+)
 from fasthep_distributed._dask._pooled import DaskPooledHTCondorCluster
 from fasthep_distributed._dask._pools import (
     DaskWorkerPool,
@@ -58,6 +63,7 @@ def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
     return {
         "workers": first_pool.workers,
         "worker_start_timeout": _worker_start_timeout(config),
+        "worker_shutdown_grace": _worker_shutdown_grace(config),
         "scheduler_options": _scheduler_options(config),
         "cluster_options": first_options,
         "pool_specs": pool_specs,
@@ -159,6 +165,14 @@ def htcondor_client(
         )
         yield client, htcondor_config
     finally:
+        # Let the workers and their jobs exit on their own before the cluster
+        # removes them: removed jobs deliver no output files and no logs.
+        htcondor_config["shutdown"] = shutdown_htcondor_workers(
+            client,
+            logs_dir=_htcondor_execution_paths(build_paths)["logs"],
+            reported_job_ids=cluster_job_ids(cluster),
+            grace=float(htcondor_config["worker_shutdown_grace"]),
+        )
         client.close()
         cluster.close()
 
@@ -463,6 +477,17 @@ def _worker_start_timeout(config: dict[str, Any]) -> float:
     if timeout <= 0:
         raise ValueError("execution.config.worker_start_timeout must be positive")
     return timeout
+
+
+def _worker_shutdown_grace(config: dict[str, Any]) -> float:
+    raw = config.get("worker_shutdown_grace", DEFAULT_WORKER_SHUTDOWN_GRACE)
+    try:
+        grace = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution.config.worker_shutdown_grace must be numeric") from exc
+    if grace < 0:
+        raise ValueError("execution.config.worker_shutdown_grace must not be negative")
+    return grace
 
 
 def _wait_for_htcondor_workers(

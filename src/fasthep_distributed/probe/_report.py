@@ -1,36 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fasthep_distributed._dask._condor_log import CondorJobState, parse_condor_log
+
 from ._submit import CONDOR_LOG_FILE, SUBMIT_RECORD_FILE
 from ._worker import FAIL, PASS
-
-_EVENT_PATTERN = re.compile(r"^(\d{3}) \((\d+)\.(\d+)\.\d+\) (\S+ \S+)")
-_RETURN_VALUE_PATTERN = re.compile(r"return value (-?\d+)")
-_SIGNAL_PATTERN = re.compile(r"signal (\d+)")
-
-_EVENT_STATES = {
-    "000": "submitted",
-    "001": "running",
-    "004": "evicted",
-    "005": "terminated",
-    "009": "aborted",
-    "012": "held",
-    "013": "released",
-}
-
-
-@dataclass(slots=True)
-class CondorJobState:
-    state: str = "unknown"
-    return_value: int | None = None
-    detail: str | None = None
-    # First timestamp of each state, as written in the event log.
-    times: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -124,43 +102,6 @@ def collect_probe(probe_dir: Path) -> ProbeCollection:
         submitted=True,
         jobs=jobs,
     )
-
-
-def parse_condor_log(path: Path, *, cluster: int) -> dict[int, CondorJobState]:
-    """Return the latest Condor state for each process of ``cluster``."""
-
-    if not path.exists():
-        return {}
-    states: dict[int, CondorJobState] = {}
-    current: CondorJobState | None = None
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = _EVENT_PATTERN.match(line)
-        if match is not None:
-            current = None
-            code, event_cluster, process, timestamp = match.groups()
-            if int(event_cluster) != cluster or code not in _EVENT_STATES:
-                continue
-            previous = states.get(int(process))
-            current = CondorJobState(
-                state=_EVENT_STATES[code],
-                times=dict(previous.times) if previous else {},
-            )
-            current.times.setdefault(current.state, timestamp)
-            states[int(process)] = current
-            continue
-        if current is None or line.strip() in {"", "..."}:
-            continue
-        text = line.strip()
-        if current.state == "terminated" and current.detail is None:
-            current.detail = text
-            value = _RETURN_VALUE_PATTERN.search(text)
-            if value is not None:
-                current.return_value = int(value.group(1))
-            elif _SIGNAL_PATTERN.search(text):
-                current.return_value = None
-        elif current.state in {"held", "aborted"} and current.detail is None:
-            current.detail = text
-    return states
 
 
 def format_collection(collection: ProbeCollection) -> str:

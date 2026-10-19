@@ -20,15 +20,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from fasthep_distributed._dask._condor_log import (
+    job_ids,
+    job_sort_key,
+    job_state_record,
+    split_job_id,
+)
+from fasthep_distributed._dask._htcondor_shutdown import shutdown_htcondor_workers
+
 from ._config import ProbeConfig
-from ._report import parse_condor_log
 from ._submit import Runner, _probe_environment, _write_json, prepare_probe_dir
 from ._worker import FAIL, PASS, SCHEMA, WARN
 
 DASK_REPORT_FILE = "dask-report.json"
-_TERMINAL_STATES = {"terminated", "aborted"}
-
-
 def run_dask_probe(
     config: ProbeConfig,
     *,
@@ -324,39 +328,15 @@ def _retire_workers(
     grace: float,
     sleep: Callable[[float], None],
 ) -> dict[str, Any]:
-    """
-    Retire workers and give their jobs time to exit on their own.
+    """Shut the workers down the way production does and report the outcome."""
 
-    dask-jobqueue stops workers with condor_rm, and removed jobs may not return
-    stdout/stderr now that output is not streamed. Letting jobs finish first
-    keeps the worker logs.
-    """
-
-    shutdown: dict[str, Any] = {"retired": False, "jobs_exited": False}
-    try:
-        client.retire_workers(
-            workers=[record["address"] for record in workers],
-            close_workers=True,
-        )
-        shutdown["retired"] = True
-    except Exception as exc:
-        shutdown["error"] = f"{type(exc).__name__}: {exc}"
-        return shutdown
-    job_ids = sorted(
-        _job_ids(logs_dir, [r["job_id"] for r in workers if r.get("job_id")]),
-        key=_job_sort_key,
+    return shutdown_htcondor_workers(
+        client,
+        logs_dir=logs_dir,
+        reported_job_ids=[str(r["job_id"]) for r in workers if r.get("job_id")],
+        grace=grace,
+        sleep=sleep,
     )
-    deadline = time.monotonic() + grace
-    while True:
-        if job_ids and all(
-            _job_state(logs_dir, job_id) in _TERMINAL_STATES for job_id in job_ids
-        ):
-            shutdown["jobs_exited"] = True
-            break
-        if time.monotonic() >= deadline:
-            break
-        sleep(5.0)
-    return shutdown
 
 
 def _condor_facts(build_paths: Any, workers: list[dict[str, Any]]) -> dict[str, Any]:
@@ -365,14 +345,14 @@ def _condor_facts(build_paths: Any, workers: list[dict[str, Any]]) -> dict[str, 
     )
 
     paths = _htcondor_execution_paths(build_paths)
-    job_ids = sorted(
-        _job_ids(paths["logs"], [r["job_id"] for r in workers if r.get("job_id")]),
-        key=_job_sort_key,
+    ids = sorted(
+        job_ids(paths["logs"], [r["job_id"] for r in workers if r.get("job_id")]),
+        key=job_sort_key,
     )
     jobs = []
-    for job_id in job_ids:
-        cluster, proc = _split_job_id(job_id)
-        state = _job_state_record(paths["logs"], job_id)
+    for job_id in ids:
+        cluster, proc = split_job_id(job_id)
+        state = job_state_record(paths["logs"], job_id)
         stdout = paths["out"] / f"worker-{cluster}.{proc}.out"
         stderr = paths["err"] / f"worker-{cluster}.{proc}.err"
         jobs.append(
@@ -387,72 +367,6 @@ def _condor_facts(build_paths: Any, workers: list[dict[str, Any]]) -> dict[str, 
             }
         )
     return {"jobs": jobs, "paths": {key: str(value) for key, value in paths.items()}}
-
-
-def _split_job_id(job_id: str) -> tuple[str, str]:
-    """Split ``<cluster>.<proc>``; HTCondor numbers the queue items of one submit."""
-
-    cluster, _, proc = str(job_id).partition(".")
-    return cluster, proc or "0"
-
-
-def _job_sort_key(job_id: str) -> tuple[int, int]:
-    cluster, proc = _split_job_id(job_id)
-    return (
-        int(cluster) if cluster.isdigit() else 0,
-        int(proc) if proc.isdigit() else 0,
-    )
-
-
-def _job_ids(logs_dir: Path, reported: list[Any]) -> set[str]:
-    """
-    All ``<cluster>.<proc>`` ids of the cluster's jobs.
-
-    Ids reported by the cluster are used as they are; a bare cluster id (and
-    each cluster found in the Condor logs) expands to every process in its log.
-    """
-
-    ids: set[str] = set()
-    clusters: set[str] = set()
-    for job_id in reported:
-        cluster, _, proc = str(job_id).partition(".")
-        if proc:
-            ids.add(f"{cluster}.{proc}")
-        clusters.add(cluster)
-    clusters |= _clusters_from_logs(logs_dir)
-    for cluster in clusters:
-        if not cluster.isdigit():
-            continue
-        states = parse_condor_log(
-            logs_dir / f"worker-{cluster}.log", cluster=int(cluster)
-        )
-        ids.update(f"{cluster}.{proc}" for proc in states)
-        if not states and not any(i.startswith(f"{cluster}.") for i in ids):
-            ids.add(f"{cluster}.0")
-    return ids
-
-
-def _clusters_from_logs(logs_dir: Path) -> set[str]:
-    if not logs_dir.is_dir():
-        return set()
-    return {
-        path.stem.removeprefix("worker-")
-        for path in logs_dir.glob("worker-*.log")
-        if path.stem.removeprefix("worker-").isdigit()
-    }
-
-
-def _job_state_record(logs_dir: Path, job_id: str) -> Any:
-    cluster, proc = _split_job_id(job_id)
-    if not cluster.isdigit() or not proc.isdigit():
-        return None
-    states = parse_condor_log(logs_dir / f"worker-{cluster}.log", cluster=int(cluster))
-    return states.get(int(proc))
-
-
-def _job_state(logs_dir: Path, job_id: str) -> str:
-    state = _job_state_record(logs_dir, job_id)
-    return state.state if state else "unknown"
 
 
 def _port_range(htcondor_config: dict[str, Any]) -> tuple[int, int] | None:

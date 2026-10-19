@@ -50,6 +50,11 @@ It does not own backend-neutral workflow semantics:
 - `strategy: htcondor` uses `dask-jobqueue` HTCondOR workers, pooled worker
   specs, worker start timeout handling, scheduler dashboard propagation and
   Flow build directories under `execution/dask/htcondor/`.
+- HTCondor workers are shut down gracefully: `htcondor_client` retires them and
+  waits up to `execution.config.worker_shutdown_grace` seconds (default 120) for
+  their jobs to exit before `cluster.close()`, because jobs removed with
+  `condor_rm` return no logs and no output files. The outcome is recorded in the
+  backend summary (`shutdown`).
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as
