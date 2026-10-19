@@ -60,6 +60,20 @@ It does not own backend-neutral workflow semantics:
   makes HTCondor send those files to EOS when the worker job exits. The
   `transfer_output_files=""` invariant is lifted only in that case. Files of a
   removed or killed worker are lost.
+- With an output destination, `DaskBackend` sets the Flow context entries
+  `output_files_root` (`.`, the job directory) and `output_destination` for
+  partition tasks only, so writers write where HTCondor sends from, while final
+  nodes on the client keep writing to the build directory. If `output_files` is
+  not given it is derived from the plan with
+  `hepflow.build_layout.partition_output_roots` (for the path
+  `{dataset}/{part}.root`, one directory per dataset), and the same names are
+  created in every job before the worker starts (`output_directories`, a
+  `mkdir -p` in the job prologue), so a worker that handled no partition of a
+  dataset still has something to send. After the worker jobs have exited, the
+  backend checks with `xrdfs` that every file listed in the writer manifests is
+  at the destination with the recorded size and adler32; the result is
+  `summary["delivery"]`, and a file that is missing or differs makes the run
+  fail with a warning per file (`_dask/_output_delivery.py`).
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as

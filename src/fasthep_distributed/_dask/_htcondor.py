@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import shlex
 import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -467,6 +468,10 @@ def _htcondor_cluster_options(
     if worker_extra_args:
         cluster_options["worker_extra_args"] = worker_extra_args
 
+    prologue = _output_directory_prologue(config)
+    if prologue:
+        cluster_options["job_script_prologue"] = prologue
+
     return cluster_options
 
 
@@ -596,26 +601,12 @@ def _output_transfer_directives(config: dict[str, Any]) -> dict[str, str]:
             "execution.config.output_destination must point into /eos/ "
             "(the CERN file-transfer plugin only supports EOS)"
         )
-    if (
-        not isinstance(files, list)
-        or not files
-        or not all(isinstance(item, str) and item.strip() for item in files)
-    ):
+    if not isinstance(files, list) or not files:
         raise ValueError(
             "execution.config.output_files must be a non-empty list of names "
             "when execution.config.output_destination is set"
         )
-    for item in files:
-        parts = Path(item).parts
-        if (
-            Path(item).is_absolute()
-            or any(part in {"", ".", ".."} for part in parts)
-            or any(ch in item for ch in ", \t\n\"'")
-        ):
-            raise ValueError(
-                f"execution.config.output_files entry {item!r} must be a simple "
-                "relative path in the job directory"
-            )
+    _validate_relative_names(files, "execution.config.output_files")
     return {
         "output_destination": destination,
         "transfer_output_files": ", ".join(files),
@@ -623,6 +614,46 @@ def _output_transfer_directives(config: dict[str, Any]) -> dict[str, str]:
         "when_to_transfer_output": "ON_EXIT",
         "MY.XRDCP_CREATE_DIR": "True",
     }
+
+
+def _validate_relative_names(items: list[Any], key: str) -> None:
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{key} entries must be non-empty strings")
+        parts = Path(item).parts
+        if (
+            Path(item).is_absolute()
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ch in item for ch in ", \t\n\"'")
+        ):
+            raise ValueError(
+                f"{key} entry {item!r} must be a simple relative path in the job "
+                "directory"
+            )
+
+
+def _output_directory_prologue(config: dict[str, Any]) -> list[str]:
+    """
+    ``mkdir`` lines creating ``execution.config.output_directories`` in the job
+    directory before the worker starts.
+
+    HTCondor is told to send these directories; a worker that never wrote into
+    one would otherwise have nothing to send. One command per line: dask-jobqueue
+    joins the prologue with ``;``.
+    """
+
+    directories = config.get("output_directories")
+    if directories is None:
+        return []
+    if config.get("output_destination") is None:
+        raise ValueError(
+            "execution.config.output_directories requires "
+            "execution.config.output_destination"
+        )
+    if not isinstance(directories, list):
+        raise ValueError("execution.config.output_directories must be a list of names")
+    _validate_relative_names(directories, "execution.config.output_directories")
+    return [f"mkdir -p -- {shlex.quote(item)}" for item in directories]
 
 
 def _worker_extra_args(raw: Any) -> list[str]:

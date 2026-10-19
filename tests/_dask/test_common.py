@@ -237,6 +237,33 @@ def test_build_dask_graph_applies_annotations_to_required_tasks(
     assert records == [{"resources": {"resource.gpu": 1, "GPU": 1}}]
 
 
+def test_build_dask_graph_gives_only_partition_tasks_the_partition_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_delayed(func: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> None:
+            seen.append(dict(kwargs["base_ctx"]))
+
+        return wrapper
+
+    dask = types.ModuleType("dask")
+    cast(Any, dask).delayed = fake_delayed
+    monkeypatch.setitem(sys.modules, "dask", dask)
+    plan = ExecutionPlan()
+    plan.partitions = [_partition()]
+    base_ctx = {"outdir": "/shared/build"}
+
+    build_dask_graph(
+        plan, base_ctx=base_ctx, partition_ctx={"output_files_root": "."}
+    )
+
+    assert seen == [{"outdir": "/shared/build", "output_files_root": "."}]
+    # Final nodes use base_ctx on the client, which must not move its files.
+    assert base_ctx == {"outdir": "/shared/build"}
+
+
 def test_build_dask_graph_skips_annotations_without_required_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -208,7 +208,9 @@ def test_output_files_specs_are_validated() -> None:
 
 def test_kill_workers_is_validated() -> None:
     raw = _raw(dask={"kill_workers": 1})
-    assert probe_config_from_mapping(raw).dask.kill_workers == 1
+    dask = probe_config_from_mapping(raw).dask
+    assert dask is not None
+    assert dask.kill_workers == 1
     for bad in (-1, 1.5, True):
         with pytest.raises(ProbeConfigError):
             probe_config_from_mapping(_raw(dask={"kill_workers": bad}))
