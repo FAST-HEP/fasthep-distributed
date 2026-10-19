@@ -435,10 +435,8 @@ def _shared_prefix_bootstrap_commands(
         "set -e",
         f"echo '[fasthep] using shared prefix {prefix}'",
         f'export PATH={_shell_quote(str(prefix / "bin"))}"${{PATH:+:$PATH}}"',
-        f"if [ ! -x {python} ]; then",
-        f'  echo "[fasthep] shared prefix Python is not visible on $(hostname):" {python} >&2',
-        "  exit 1",
-        "fi",
+        # One line per command: jobqueue joins the prologue with "; ".
+        f'[ -x {python} ] || {{ echo "[fasthep] shared prefix Python is not visible on $(hostname):" {python} >&2; exit 1; }}',
         f"{python} --version",
         f"{python} -c {_shell_quote(imports)}",
         f"{python} -m distributed.cli.dask_worker --help >/dev/null",

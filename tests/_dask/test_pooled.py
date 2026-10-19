@@ -1136,6 +1136,10 @@ def test_shared_prefix_environment_uses_prefix_python_without_transfers(
     assert prepared.environment_archive is None
     assert verified == [["distributed", "hepflow"]]
     script = "\n".join(prepared.bootstrap_commands)
+    # dask-jobqueue joins the prologue with "; ": every command must stand alone.
+    joined = "; ".join(prepared.bootstrap_commands)
+    assert all("\n" not in command for command in prepared.bootstrap_commands)
+    assert subprocess.run(["bash", "-n", "-c", joined], check=False).returncode == 0
     assert f"export PATH='{prefix / 'bin'}'" in script
     assert "distributed.cli.dask_worker --help" in script
     assert "importlib.import_module" in script
