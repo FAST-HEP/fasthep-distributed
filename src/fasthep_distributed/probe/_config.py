@@ -21,12 +21,15 @@ _TOP_LEVEL_KEYS = {
     "lockfile",
     "imports",
     "paths",
+    "xrootd",
+    "eos_write",
+    "output_files",
     "condor",
     "submit_dir",
     "timeouts",
     "dask",
 }
-_DASK_KEYS = {"use", "execution", "retire_grace", "task_timeout"}
+_DASK_KEYS = {"use", "execution", "retire_grace", "task_timeout", "kill_workers"}
 _CONDOR_KEYS = {
     "flavour",
     "request_cpus",
@@ -46,6 +49,30 @@ class PathSpec:
     name: str
     path: str
     required: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class XrootdSpec:
+    name: str
+    url: str
+    required: bool = True
+    expect_size: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class EosWriteSpec:
+    name: str
+    url: str
+    required: bool = True
+    size_bytes: int = 1024 * 1024
+
+
+@dataclass(slots=True, frozen=True)
+class OutputFilesSpec:
+    name: str
+    subdir: str
+    size_bytes: int = 65536
+    shared_name: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -73,6 +100,9 @@ class DaskProbeSpec:
     base_dir: Path = field(default_factory=Path.cwd)
     retire_grace: float = 120.0
     task_timeout: float = 900.0
+    # Number of workers to remove with condor_rm after their checks, before the
+    # others retire. Tests what output survives a worker that never exits cleanly.
+    kill_workers: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -83,6 +113,9 @@ class ProbeConfig:
     required_imports: tuple[str, ...] = DEFAULT_REQUIRED_IMPORTS
     optional_imports: tuple[str, ...] = ()
     paths: tuple[PathSpec, ...] = ()
+    xrootd: tuple[XrootdSpec, ...] = ()
+    eos_write: tuple[EosWriteSpec, ...] = ()
+    output_files: tuple[OutputFilesSpec, ...] = ()
     condor: CondorSpec = field(default_factory=CondorSpec)
     forbidden_submit_prefixes: tuple[str, ...] = DEFAULT_FORBIDDEN_SUBMIT_PREFIXES
     required_submit_prefix: str | None = None
@@ -106,6 +139,33 @@ class ProbeConfig:
             "paths": [
                 {"name": item.name, "path": item.path, "required": item.required}
                 for item in self.paths
+            ],
+            "xrootd": [
+                {
+                    "name": item.name,
+                    "url": item.url,
+                    "required": item.required,
+                    "expect_size": item.expect_size,
+                }
+                for item in self.xrootd
+            ],
+            "eos_write": [
+                {
+                    "name": item.name,
+                    "url": item.url,
+                    "required": item.required,
+                    "size_bytes": item.size_bytes,
+                }
+                for item in self.eos_write
+            ],
+            "output_files": [
+                {
+                    "name": item.name,
+                    "subdir": item.subdir,
+                    "size_bytes": item.size_bytes,
+                    "shared_name": item.shared_name,
+                }
+                for item in self.output_files
             ],
             "timeouts": dict(self.timeouts),
         }
@@ -186,6 +246,9 @@ def probe_config_from_mapping(
         required_imports=required_imports,
         optional_imports=optional_imports,
         paths=_path_specs(raw.get("paths") or [], base),
+        xrootd=_xrootd_specs(raw.get("xrootd") or []),
+        eos_write=_eos_write_specs(raw.get("eos_write") or []),
+        output_files=_output_files_specs(raw.get("output_files") or []),
         condor=_condor_spec(raw.get("condor") or {}),
         forbidden_submit_prefixes=forbidden,
         required_submit_prefix=required_prefix,
@@ -213,12 +276,16 @@ def _dask_spec(raw: Any, base: Path) -> DaskProbeSpec | None:
         if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
             raise ProbeConfigError(f"'dask.{key}' must be a non-negative number")
         values[key] = float(value)
+    kill_workers = raw.get("kill_workers", 0)
+    if isinstance(kill_workers, bool) or not isinstance(kill_workers, int) or kill_workers < 0:
+        raise ProbeConfigError("'dask.kill_workers' must be a non-negative integer")
     return DaskProbeSpec(
         use=dict(use),
         execution=dict(execution),
         base_dir=base,
         retire_grace=values["retire_grace"],
         task_timeout=values["task_timeout"],
+        kill_workers=kill_workers,
     )
 
 
@@ -266,6 +333,107 @@ def _path_specs(raw: Any, base: Path) -> tuple[PathSpec, ...]:
                 name=name,
                 path=str(_absolute(item["path"], base, f"paths[{index}].path")),
                 required=required,
+            )
+        )
+    return tuple(specs)
+
+
+def _xrootd_specs(raw: Any) -> tuple[XrootdSpec, ...]:
+    if not isinstance(raw, list):
+        raise ProbeConfigError("'xrootd' must be a list")
+    specs: list[XrootdSpec] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        where = f"xrootd[{index}]"
+        if not isinstance(item, Mapping):
+            raise ProbeConfigError(f"{where} must be a mapping")
+        _reject_unknown(item, {"name", "url", "required", "expect_size"}, where)
+        name = item.get("name")
+        if not isinstance(name, str) or not _NAME_PATTERN.match(name):
+            raise ProbeConfigError(f"{where}.name must match {_NAME_PATTERN.pattern}")
+        if name in seen:
+            raise ProbeConfigError(f"duplicate xrootd name {name!r}")
+        seen.add(name)
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith(("root://", "xroot://")):
+            raise ProbeConfigError(f"{where}.url must be a root:// URL")
+        required = item.get("required", True)
+        if not isinstance(required, bool):
+            raise ProbeConfigError(f"{where}.required must be a boolean")
+        size = item.get("expect_size")
+        if size is not None and (isinstance(size, bool) or not isinstance(size, int)):
+            raise ProbeConfigError(f"{where}.expect_size must be an integer")
+        specs.append(
+            XrootdSpec(name=name, url=url, required=required, expect_size=size)
+        )
+    return tuple(specs)
+
+
+def _eos_write_specs(raw: Any) -> tuple[EosWriteSpec, ...]:
+    if not isinstance(raw, list):
+        raise ProbeConfigError("'eos_write' must be a list")
+    specs: list[EosWriteSpec] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        where = f"eos_write[{index}]"
+        if not isinstance(item, Mapping):
+            raise ProbeConfigError(f"{where} must be a mapping")
+        _reject_unknown(item, {"name", "url", "required", "size_bytes"}, where)
+        name = item.get("name")
+        if not isinstance(name, str) or not _NAME_PATTERN.match(name):
+            raise ProbeConfigError(f"{where}.name must match {_NAME_PATTERN.pattern}")
+        if name in seen:
+            raise ProbeConfigError(f"duplicate eos_write name {name!r}")
+        seen.add(name)
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith(("root://", "xroot://")):
+            raise ProbeConfigError(f"{where}.url must be a root:// directory URL")
+        required = item.get("required", True)
+        if not isinstance(required, bool):
+            raise ProbeConfigError(f"{where}.required must be a boolean")
+        size = item.get("size_bytes", 1024 * 1024)
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ProbeConfigError(f"{where}.size_bytes must be a positive integer")
+        specs.append(
+            EosWriteSpec(name=name, url=url, required=required, size_bytes=size)
+        )
+    return tuple(specs)
+
+
+def _output_files_specs(raw: Any) -> tuple[OutputFilesSpec, ...]:
+    if not isinstance(raw, list):
+        raise ProbeConfigError("'output_files' must be a list")
+    specs: list[OutputFilesSpec] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        where = f"output_files[{index}]"
+        if not isinstance(item, Mapping):
+            raise ProbeConfigError(f"{where} must be a mapping")
+        _reject_unknown(item, {"name", "subdir", "size_bytes", "shared_name"}, where)
+        name = item.get("name")
+        if not isinstance(name, str) or not _NAME_PATTERN.match(name):
+            raise ProbeConfigError(f"{where}.name must match {_NAME_PATTERN.pattern}")
+        if name in seen:
+            raise ProbeConfigError(f"duplicate output_files name {name!r}")
+        seen.add(name)
+        subdir = item.get("subdir")
+        if (
+            not isinstance(subdir, str)
+            or not _NAME_PATTERN.match(subdir)
+            or subdir in {".", ".."}
+        ):
+            raise ProbeConfigError(f"{where}.subdir must be a simple directory name")
+        size = item.get("size_bytes", 65536)
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ProbeConfigError(f"{where}.size_bytes must be a positive integer")
+        shared = item.get("shared_name")
+        if shared is not None and (
+            not isinstance(shared, str) or not _NAME_PATTERN.match(shared)
+        ):
+            raise ProbeConfigError(f"{where}.shared_name must be a simple file name")
+        specs.append(
+            OutputFilesSpec(
+                name=name, subdir=subdir, size_bytes=size, shared_name=shared
             )
         )
     return tuple(specs)

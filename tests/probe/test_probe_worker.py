@@ -277,3 +277,129 @@ def test_submit_mode_skips_scratch(tmp_path: Path) -> None:
 
     assert "scratch" not in [check["name"] for check in report["checks"]]
     assert "submit" not in report
+
+
+def test_check_xrootd_copies_file_and_checks_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "xrdcp"
+    fake.write_text('#!/bin/sh\nprintf 12345 > "$4"\n', encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+    monkeypatch.setenv("X509_USER_PROXY", str(tmp_path / "proxy"))
+
+    status, detail = worker.check_xrootd("root://h//f", 5, timeout=10)
+    assert status == worker.PASS
+    assert detail["size_bytes"] == 5
+    assert detail["x509_proxy"] == {
+        "env_set": True,
+        "path": str(tmp_path / "proxy"),
+        "exists": False,
+    }
+    assert not list(tmp_path.glob(".fasthep-probe-xrootd-*"))
+
+    status, detail = worker.check_xrootd("root://h//f", 6, timeout=10)
+    assert status == worker.FAIL
+    assert "expected 6" in detail["error"]
+
+
+def test_check_xrootd_fails_without_xrdcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    status, detail = worker.check_xrootd("root://h//f", None, timeout=10)
+
+    assert status == worker.FAIL
+    assert "xrdcp" in detail["error"]
+
+
+def test_check_eos_write_publishes_renames_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fake EOS: xrdcp copies into a dir, xrdfs mv/stat/rm act on it.
+    eos = tmp_path / "eos"
+    eos.mkdir()
+    (tmp_path / "xrdcp").write_text(
+        f'#!/bin/sh\nshift 3\ncp "$1" "{eos}/$(basename "${{2##*//}}")"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "xrdfs").write_text(
+        "#!/bin/sh\n"
+        f'd="{eos}"\nop="$2"\n'
+        'case "$op" in\n'
+        '  mv) mv "$d/$(basename "$3")" "$d/$(basename "$4")";;\n'
+        '  stat) echo "Size:   $(wc -c < "$d/$(basename "$3")")";;\n'
+        '  rm) rm -f "$d/$(basename "$3")";;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    for name in ("xrdcp", "xrdfs"):
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+
+    status, detail = worker.check_eos_write(
+        "root://eos.example//eos/user/x/testing", 2048, timeout=10
+    )
+
+    assert status == worker.PASS, detail
+    assert detail["remote_size_bytes"] == 2048
+    assert set(detail["steps"]) == {"copy_temp", "rename", "stat"}
+    assert list(eos.iterdir()) == []
+    assert not list(tmp_path.glob(".fasthep-probe-eos-*"))
+
+
+def test_check_eos_write_reports_failed_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "xrdcp").write_text("#!/bin/sh\necho denied >&2\nexit 54\n")
+    (tmp_path / "xrdfs").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("xrdcp", "xrdfs"):
+        (tmp_path / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+
+    status, detail = worker.check_eos_write("root://h//eos/d", 16, timeout=10)
+
+    assert status == worker.FAIL
+    assert "copy_temp" in detail["error"]
+    assert "denied" in detail["error"]
+
+
+def test_check_output_files_writes_partition_and_decoy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+
+    status, detail = worker.check_output_files("dataset_a", 128)
+
+    assert status == worker.PASS
+    paths = [item["path"] for item in detail["files"]]
+    assert paths[0].startswith("dataset_a/")
+    assert paths[0].endswith("_0.root")
+    assert paths[1].startswith("flat-")
+    for item in detail["files"]:
+        assert (tmp_path / item["path"]).stat().st_size == 128
+        assert len(item["sha256"]) == 64
+
+
+def test_check_output_files_shared_name_differs_between_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+
+    _, first = worker.check_output_files("d", 64, "same_0.root")
+    _, second = worker.check_output_files("d", 64, "same_0.root")
+
+    names = [item["path"] for item in first["files"]]
+    assert "d/same_0.root" in names
+    # Unique per call, shared name identical but content differs.
+    unique = [n for n in names if n.endswith("_0.root") and "same" not in n]
+    assert unique
+    assert unique[0] not in [i["path"] for i in second["files"]]
+    shared = {
+        item["sha256"] for item in first["files"] + second["files"] if "same" in item["path"]
+    }
+    assert len(shared) == 2

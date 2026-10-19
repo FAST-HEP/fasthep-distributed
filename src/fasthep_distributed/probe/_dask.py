@@ -115,10 +115,15 @@ def run_dask_probe(
             # moved") and the jobs only end through condor_rm, which returns no
             # stdout/stderr.
             client.cancel(list(futures.values()))
+            killed = _kill_workers(workers, config.dask.kill_workers, sleep=sleep)
+            if killed:
+                report["killed_jobs"] = killed
+            killed_set = set(killed)
+            remaining = [r for r in workers if r.get("job_id") not in killed_set]
             retire_started = time.monotonic()
             report["shutdown"] = _retire_workers(
                 client,
-                workers,
+                remaining,
                 logs_dir=_htcondor_execution_paths(build_paths)["logs"],
                 grace=config.dask.retire_grace,
                 sleep=sleep,
@@ -318,6 +323,36 @@ def _worker_records(
             }
         )
     return records
+
+
+def _kill_workers(
+    workers: list[dict[str, Any]],
+    count: int,
+    *,
+    sleep: Callable[[float], None],
+) -> list[str]:
+    """
+    ``condor_rm`` the first ``count`` workers (by job id) and return their job ids.
+
+    Used to see what a worker leaves behind when its job is removed instead of
+    exiting on its own.
+    """
+
+    if count <= 0:
+        return []
+    job_ids = sorted(
+        (r["job_id"] for r in workers if r.get("job_id")), key=job_sort_key
+    )[:count]
+    for job_id in job_ids:
+        subprocess.run(
+            ["condor_rm", job_id],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    sleep(10.0)
+    return job_ids
 
 
 def _retire_workers(
