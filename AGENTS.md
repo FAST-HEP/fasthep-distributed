@@ -55,6 +55,11 @@ It does not own backend-neutral workflow semantics:
   their jobs to exit before `cluster.close()`, because jobs removed with
   `condor_rm` return no logs and no output files. The outcome is recorded in the
   backend summary (`shutdown`).
+- `execution.config.output_destination` (a `root://` URL into `/eos/`, for the
+  CERN file-transfer plugin) with `output_files` (names in the job directory)
+  makes HTCondor send those files to EOS when the worker job exits. The
+  `transfer_output_files=""` invariant is lifted only in that case. Files of a
+  removed or killed worker are lost.
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as

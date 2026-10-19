@@ -290,9 +290,13 @@ def _prepare_htcondor_pool_specs_impl(
             )
             spec["job_kwargs"] = job_kwargs
         job_kwargs["submit_directory"] = str(_dask_htcondor_dir(build_paths, "submit"))
+        pool_directives = dict(job_kwargs.get("job_extra_directives") or {})
+        bootstrap_directives = _htcondor_bootstrap_directives(paths)
+        if _has_output_destination(pool_directives):
+            bootstrap_directives.pop("transfer_output_files")
         job_kwargs["job_extra_directives"] = _merge_htcondor_directives(
-            dict(job_kwargs.get("job_extra_directives") or {}),
-            _htcondor_bootstrap_directives(paths),
+            pool_directives,
+            bootstrap_directives,
             f"HTCondor worker pool {name!r}",
         )
     preparation_progress.complete(
@@ -434,6 +438,13 @@ def _htcondor_cluster_options(
             site_directives,
             "execution.config.site_directives",
         )
+    output_directives = _output_transfer_directives(config)
+    if output_directives:
+        job_extra_directives = _merge_htcondor_directives(
+            job_extra_directives,
+            output_directives,
+            "execution.config.output_destination",
+        )
     if config.get("job_extra_directives") is not None:
         raw_directives = config["job_extra_directives"]
         if not isinstance(raw_directives, dict):
@@ -530,13 +541,17 @@ def _merge_htcondor_directives(
     source: str,
 ) -> dict[str, Any]:
     merged = dict(base)
-    fixed_by_lower = {key.lower(): key for key in _HTCONDOR_FIXED_DIRECTIVES}
+    fixed_directives = dict(_HTCONDOR_FIXED_DIRECTIVES)
+    if _has_output_destination(base) or _has_output_destination(overlay):
+        # With an output destination the files to send are chosen by the user.
+        fixed_directives.pop("transfer_output_files")
+    fixed_by_lower = {key.lower(): key for key in fixed_directives}
     runtime_by_lower = {key.lower(): key for key in _HTCONDOR_RUNTIME_DIRECTIVES}
     for key, value in overlay.items():
         key_lower = str(key).lower()
         fixed_key = fixed_by_lower.get(key_lower)
         if fixed_key is not None:
-            expected = _HTCONDOR_FIXED_DIRECTIVES[fixed_key]
+            expected = fixed_directives[fixed_key]
             if str(value) != expected:
                 raise ValueError(
                     f"{source} cannot override HTCondor invariant {fixed_key}={expected}"
@@ -548,6 +563,66 @@ def _merge_htcondor_directives(
             )
         merged[key] = value
     return merged
+
+
+def _has_output_destination(directives: dict[str, Any]) -> bool:
+    return any(str(key).lower() == "output_destination" for key in directives)
+
+
+def _output_transfer_directives(config: dict[str, Any]) -> dict[str, str]:
+    """
+    HTCondor directives for sending job output files to a remote destination.
+
+    ``execution.config.output_destination`` is an XRootD URL; at CERN this uses
+    the EOS file-transfer plugin (Kerberos). ``execution.config.output_files``
+    lists what to send, relative to the job directory. HTCondor copies these
+    when the job exits, so outputs of a long-lived worker arrive only then.
+    """
+
+    destination = config.get("output_destination")
+    files = config.get("output_files")
+    if destination is None:
+        if files is not None:
+            raise ValueError(
+                "execution.config.output_files requires execution.config.output_destination"
+            )
+        return {}
+    if not isinstance(destination, str) or not destination.startswith(
+        ("root://", "xroot://")
+    ):
+        raise ValueError("execution.config.output_destination must be a root:// URL")
+    if "/eos/" not in destination:
+        raise ValueError(
+            "execution.config.output_destination must point into /eos/ "
+            "(the CERN file-transfer plugin only supports EOS)"
+        )
+    if (
+        not isinstance(files, list)
+        or not files
+        or not all(isinstance(item, str) and item.strip() for item in files)
+    ):
+        raise ValueError(
+            "execution.config.output_files must be a non-empty list of names "
+            "when execution.config.output_destination is set"
+        )
+    for item in files:
+        parts = Path(item).parts
+        if (
+            Path(item).is_absolute()
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ch in item for ch in ", \t\n\"'")
+        ):
+            raise ValueError(
+                f"execution.config.output_files entry {item!r} must be a simple "
+                "relative path in the job directory"
+            )
+    return {
+        "output_destination": destination,
+        "transfer_output_files": ", ".join(files),
+        "should_transfer_files": "YES",
+        "when_to_transfer_output": "ON_EXIT",
+        "MY.XRDCP_CREATE_DIR": "True",
+    }
 
 
 def _worker_extra_args(raw: Any) -> list[str]:

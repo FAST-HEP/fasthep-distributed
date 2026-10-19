@@ -929,6 +929,63 @@ def test_htcondor_site_directives_cannot_override_invariants() -> None:
         _default_pool_options({"site_directives": {"transfer_executable": "True"}})
 
 
+def test_htcondor_output_destination_sets_transfer_directives() -> None:
+    options = _default_pool_options(
+        {
+            "output_destination": "root://eosuser.cern.ch//eos/user/x/y/out/$(ClusterId)/",
+            "output_files": ["datasetA", "manifest.json"],
+        }
+    )
+
+    directives = options["job_extra_directives"]
+    assert directives["output_destination"].startswith("root://eosuser.cern.ch//eos/")
+    assert directives["transfer_output_files"] == "datasetA, manifest.json"
+    assert directives["MY.XRDCP_CREATE_DIR"] == "True"
+    assert directives["should_transfer_files"] == "YES"
+    assert directives["when_to_transfer_output"] == "ON_EXIT"
+    assert directives["transfer_executable"] == "False"
+
+
+def test_htcondor_transfer_output_files_stays_invariant_without_destination() -> None:
+    options = _default_pool_options({})
+    assert options["job_extra_directives"]["transfer_output_files"] == '""'
+    with pytest.raises(ValueError, match="cannot override"):
+        _default_pool_options({"job_extra_directives": {"transfer_output_files": "a"}})
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ({"output_files": ["a"]}, "requires execution.config.output_destination"),
+        (
+            {"output_destination": "/eos/user/x", "output_files": ["a"]},
+            "must be a root:// URL",
+        ),
+        (
+            {"output_destination": "root://host//data/x", "output_files": ["a"]},
+            "must point into /eos/",
+        ),
+        (
+            {"output_destination": "root://h//eos/user/x/"},
+            "non-empty list",
+        ),
+        (
+            {"output_destination": "root://h//eos/user/x/", "output_files": ["../a"]},
+            "simple relative path",
+        ),
+        (
+            {"output_destination": "root://h//eos/user/x/", "output_files": ["a,b"]},
+            "simple relative path",
+        ),
+    ],
+)
+def test_htcondor_output_destination_is_validated(
+    config: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _default_pool_options(config)
+
+
 @pytest.mark.parametrize(
     ("config", "expected"),
     [
