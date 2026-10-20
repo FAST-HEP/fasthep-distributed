@@ -566,10 +566,27 @@ def _merge_hook_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             )
             if key not in merged:
                 order.append(key)
-                merged[key] = dict(item)
+                merged[key] = {k: v for k, v in item.items() if k != "results"}
                 merged[key]["calls"] = 0
             merged[key]["calls"] += int(item.get("calls") or 0)
+            _merge_hook_results(merged[key], item.get("results"))
     return {"enabled": [merged[key] for key in order]}
+
+
+def _merge_hook_results(target: dict[str, Any], results: Any) -> None:
+    """Append list results and update mapping results across partitions."""
+    if not isinstance(results, dict):
+        return
+    if not isinstance(target.get("results"), dict):
+        target["results"] = {}
+    merged = target["results"]
+    for name, value in results.items():
+        if isinstance(value, list):
+            merged[name] = [*(merged.get(name) or []), *value]
+        elif isinstance(value, dict):
+            merged[name] = {**(merged.get(name) or {}), **value}
+        else:
+            merged[name] = value
 
 
 def _as_bool(value: Any) -> bool:
