@@ -8,6 +8,7 @@ import pytest
 from fasthep_distributed._dask._condor_log import parse_condor_log
 from fasthep_distributed._dask._htcondor import normalize_dask_htcondor_config
 from fasthep_distributed._dask._htcondor_shutdown import (
+    RELEASE_WAIT,
     RETIRE_WAIT,
     cluster_job_ids,
     shutdown_htcondor_workers,
@@ -100,6 +101,68 @@ def test_condor_log_ignores_input_transfer_events(tmp_path: Path) -> None:
     state = parse_condor_log(logs / f"worker-{CLUSTER}.log", cluster=CLUSTER)[0]
 
     assert state.output_transferred is False
+
+
+class HeldResultsClient(FakeClient):
+    """Scheduler that reports how many tasks still have results on workers."""
+
+    def __init__(self, held: list[int]) -> None:
+        super().__init__()
+        self.held = list(held)
+
+    def run_on_scheduler(self, func: Any) -> int:
+        self.calls.append("held?")
+        return self.held.pop(0) if len(self.held) > 1 else self.held[0]
+
+
+def test_shutdown_waits_for_results_to_be_released_before_retiring(
+    tmp_path: Path,
+) -> None:
+    logs = _log(
+        tmp_path,
+        _event("000", "Job submitted"),
+        _event("001", "Job executing"),
+        _event("005", "Job terminated."),
+    )
+    client = HeldResultsClient([3, 1, 0])
+
+    summary = shutdown_htcondor_workers(
+        client,
+        logs_dir=logs,
+        reported_job_ids=[f"{CLUSTER}.0"],
+        sleep=lambda seconds: None,
+    )
+
+    assert client.calls[:4] == ["held?", "held?", "held?", "retire"]
+    assert summary["results_released"] is True
+
+
+def test_shutdown_retires_after_release_wait_when_results_stay(
+    tmp_path: Path,
+) -> None:
+    logs = _log(
+        tmp_path,
+        _event("000", "Job submitted"),
+        _event("001", "Job executing"),
+        _event("005", "Job terminated."),
+    )
+    now = [0.0]
+    client = HeldResultsClient([2])
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    summary = shutdown_htcondor_workers(
+        client,
+        logs_dir=logs,
+        reported_job_ids=[f"{CLUSTER}.0"],
+        sleep=sleep,
+        monotonic=lambda: now[0],
+    )
+
+    assert "retire" in client.calls
+    assert summary["results_released"] is False
+    assert now[0] >= RELEASE_WAIT
 
 
 def test_shutdown_returns_at_once_when_jobs_already_exited(tmp_path: Path) -> None:

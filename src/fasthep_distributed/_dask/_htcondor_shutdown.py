@@ -26,6 +26,10 @@ DEFAULT_WORKER_SHUTDOWN_GRACE = 120.0
 # shut down instead (a worker holding unique data refuses to retire).
 RETIRE_WAIT = 30.0
 POLL_SECONDS = 5.0
+# How long to wait for the scheduler to forget the results before retiring:
+# releases are asynchronous, and a worker that still holds data cannot retire.
+RELEASE_WAIT = 10.0
+RELEASE_POLL_SECONDS = 0.5
 # Only jobs that have started can still send output; idle or held jobs are not
 # waited for (the cluster removes them afterwards).
 _RUNNING_STATES = {"running", "evicted", "released"}
@@ -67,6 +71,9 @@ def shutdown_htcondor_workers(
         "grace_s": grace,
     }
     started = monotonic()
+    summary["results_released"] = _wait_until_results_released(
+        client, sleep=sleep, monotonic=monotonic
+    )
     addresses = _connected_workers(client)
     if addresses:
         try:
@@ -104,6 +111,36 @@ def shutdown_htcondor_workers(
     summary["waited_s"] = round(monotonic() - started, 3)
     summary["jobs"] = {i: _job_summary(logs_dir, i) for i in ids}
     return summary
+
+
+def _held_task_count(dask_scheduler: Any) -> int:
+    """Number of tasks whose result still sits on a worker (runs on the scheduler)."""
+
+    return sum(1 for task in dask_scheduler.tasks.values() if task.who_has)
+
+
+def _wait_until_results_released(
+    client: Any,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> bool:
+    """Wait (bounded) until no worker holds task results; True when none do."""
+
+    run = getattr(client, "run_on_scheduler", None)
+    if run is None:
+        return True
+    deadline = monotonic() + RELEASE_WAIT
+    while True:
+        try:
+            held = run(_held_task_count)
+        except Exception:
+            return False
+        if not held:
+            return True
+        if monotonic() >= deadline:
+            return False
+        sleep(RELEASE_POLL_SECONDS)
 
 
 def _connected_workers(client: Any) -> list[str]:

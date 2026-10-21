@@ -306,7 +306,13 @@ def compute_with_client(client: Any, tasks: list[Any]) -> tuple[list[Any], str |
     if not tasks:
         return [], dashboard_link
     futures = client.compute(tasks)
-    return list(client.gather(futures)), dashboard_link
+    try:
+        return list(client.gather(futures)), dashboard_link
+    finally:
+        # Release the results on the workers now. Workers that still hold data
+        # refuse to retire, and the shutdown fallback then removes their jobs
+        # before HTCondor has sent their output.
+        client.cancel(futures)
 
 
 def compute_with_scheduler(

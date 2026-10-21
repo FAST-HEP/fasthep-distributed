@@ -305,6 +305,9 @@ def test_htcondor_cluster_scales_workers_and_computes_tasks(
             calls["gathered_futures"] = futures
             return [{"value_store": {}, "warnings": [], "hooks": {"enabled": []}}]
 
+        def cancel(self, futures: list[Any]) -> None:
+            calls["cancelled_futures"] = futures
+
         def close(self) -> None:
             self.closed = True
             calls["client_closed"] = True

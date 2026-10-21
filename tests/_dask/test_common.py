@@ -36,9 +36,17 @@ def test_compute_with_client_uses_client_compute_and_gather() -> None:
             calls["futures"] = futures
             return [{"ok": True}]
 
+        def cancel(self, futures: list[Any]) -> None:
+            calls["cancelled"] = futures
+
     results, dashboard_link = compute_with_client(FakeClient(), ["task"])
 
-    assert calls == {"tasks": ["task"], "futures": ["future"]}
+    # The results are released on the workers right after they are gathered.
+    assert calls == {
+        "tasks": ["task"],
+        "futures": ["future"],
+        "cancelled": ["future"],
+    }
     assert results == [{"ok": True}]
     assert dashboard_link == "http://scheduler.example/status"
 

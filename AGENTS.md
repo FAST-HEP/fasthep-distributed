@@ -53,8 +53,12 @@ It does not own backend-neutral workflow semantics:
 - HTCondor workers are shut down gracefully: `htcondor_client` retires them and
   waits up to `execution.config.worker_shutdown_grace` seconds (default 120) for
   their jobs to exit before `cluster.close()`, because jobs removed with
-  `condor_rm` return no logs and no output files. The outcome is recorded in the
-  backend summary (`shutdown`).
+  `condor_rm` return no logs and no output files. Workers that still hold task
+  results refuse to retire (and the scheduler-shutdown fallback makes the cluster
+  `condor_rm` them), so `compute_with_client` cancels the result futures after
+  gathering and the shutdown waits for the scheduler to hold no data first
+  (`results_released` in `shutdown`). The outcome is recorded in the backend
+  summary (`shutdown`).
 - `execution.config.output_destination` (a `root://` URL into `/eos/`, for the
   CERN file-transfer plugin) with `output_files` (names in the job directory)
   makes HTCondor send those files to EOS when the worker job exits. The
