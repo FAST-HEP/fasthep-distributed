@@ -8,6 +8,12 @@ from hepflow.backends.model import BackendResult
 from hepflow.build_layout import BuildPaths
 from hepflow.model.plan import ExecutionNode, ExecutionPartition, ExecutionPlan
 from hepflow.progress import ProgressReporter
+from hepflow.registry.loaders import runtime_registry_from_config
+from hepflow.runtime.boundary import (
+    boundary_products_to_value_store,
+    extract_boundary_products,
+    plan_partition_boundary,
+)
 from hepflow.runtime.engine import (
     _register_product_bindings,
     build_dataset_context,
@@ -540,6 +546,20 @@ def _execute_partition_task(
     )
     for key in dict(initial_values or {}):
         value_store.pop(key, None)
+    # Return what crosses the partition boundary, as the local backend does,
+    # not every node's event stream: serialising those separately takes a
+    # worker past 20 GB on a 100k-event file.
+    runtime_registry = runtime_registry_from_config(registry_cfg or plan.registry)
+    value_store = boundary_products_to_value_store(
+        extract_boundary_products(
+            plan,
+            value_store,
+            partition=partition,
+            boundary=plan_partition_boundary(plan, runtime_registry=runtime_registry),
+            runtime_registry=runtime_registry,
+            ctx=partition_ctx,
+        )
+    )
     partition_ctx["_hook_summary"] = hook_manager.usage_summary()
     partition_meta = partition.to_context()
     for warning in warnings:

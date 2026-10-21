@@ -9,7 +9,9 @@ from typing import Any, cast
 import pytest
 from hepflow.model.plan import ExecutionNode, ExecutionPartition, ExecutionPlan
 
+from fasthep_distributed._dask import _common
 from fasthep_distributed._dask._common import (
+    _execute_partition_task,
     build_dask_graph,
     compute_with_client,
     dask_resource_annotations_for_node,
@@ -318,6 +320,44 @@ def test_build_dask_graph_ignores_modifier_metadata(
 
     assert tasks[0]["annotations"] == {}
     assert records == [{}]
+
+
+def test_partition_task_returns_only_boundary_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ExecutionPlan()
+    for node_id, outputs in (
+        ("read", {"stream": "event_stream"}),
+        ("stage", {"stream": "event_stream", "cutflow": "cutflow"}),
+    ):
+        plan.add_node(
+            ExecutionNode(
+                id=node_id,
+                graph_node_id=node_id,
+                role="source" if node_id == "read" else "transform",
+                impl=f"toy.{node_id}",
+                outputs=outputs,
+            )
+        )
+    store = {
+        ("read", "stream"): "raw events",
+        ("stage", "stream"): "selected events",
+        ("stage", "cutflow"): {"rows": 1},
+    }
+    monkeypatch.setattr(_common, "execute_plan_partition", lambda *a, **k: dict(store))
+    registry = {
+        "product_handlers": {
+            "cutflow": {"boundary": {"retain": True, "representation": "value"}}
+        }
+    }
+
+    result = _execute_partition_task(
+        plan, _partition(), base_ctx={}, registry_cfg=registry
+    )
+
+    # Event streams are not retained: serialising every node's stream separately
+    # took Dask workers past their memory limit.
+    assert result["value_store"] == {("stage", "cutflow"): {"rows": 1}}
 
 
 def _plan_with_node_execution(
