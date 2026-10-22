@@ -1,0 +1,22 @@
+# Dask workers on CERN HTCondor, with the scheduler on lxplus.
+#
+# Presets from https://batchdocs.web.cern.ch/specialpayload/dask.html and
+# dask-lxplus (CernCluster). Use as
+#   use: {profiles: [fasthep_distributed:dask_htcondor_cern]}
+# and add resources, workers, queue and the worker environment in the workflow.
+execution:
+  backend: dask
+  strategy: htcondor
+  config:
+    scheduler_options:
+      # Workers can reach lxplus only on port 8786. Ports are per node and
+      # shared by all users: one such scheduler per lxplus node.
+      host: fqdn
+      port: 8786
+    # Ports open on CERN batch nodes. The nanny gets a port from the same range;
+    # set nanny: false (as in CERN's example) if that does not work.
+    worker_port_range: "10000:10100"
+    nanny: true
+    site_directives:
+      MY.IsDaskWorker: "true"
+      JobBatchName: '"fasthep-dask-worker"'

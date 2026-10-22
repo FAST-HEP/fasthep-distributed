@@ -50,6 +50,34 @@ It does not own backend-neutral workflow semantics:
 - `strategy: htcondor` uses `dask-jobqueue` HTCondOR workers, pooled worker
   specs, worker start timeout handling, scheduler dashboard propagation and
   Flow build directories under `execution/dask/htcondor/`.
+- HTCondor workers are shut down gracefully: `htcondor_client` retires them and
+  waits up to `execution.config.worker_shutdown_grace` seconds (default 120) for
+  their jobs to exit before `cluster.close()`, because jobs removed with
+  `condor_rm` return no logs and no output files. Workers that still hold task
+  results refuse to retire (and the scheduler-shutdown fallback makes the cluster
+  `condor_rm` them), so `compute_with_client` cancels the result futures after
+  gathering and the shutdown waits for the scheduler to hold no data first
+  (`results_released` in `shutdown`). The outcome is recorded in the backend
+  summary (`shutdown`).
+- `execution.config.output_destination` (a `root://` URL into `/eos/`, for the
+  CERN file-transfer plugin) with `output_files` (names in the job directory)
+  makes HTCondor send those files to EOS when the worker job exits. The
+  `transfer_output_files=""` invariant is lifted only in that case. Files of a
+  removed or killed worker are lost.
+- With an output destination, `DaskBackend` sets the Flow context entries
+  `output_files_root` (`.`, the job directory) and `output_destination` for
+  partition tasks only, so writers write where HTCondor sends from, while final
+  nodes on the client keep writing to the build directory. If `output_files` is
+  not given it is derived from the plan with
+  `hepflow.build_layout.partition_output_roots` (for the path
+  `{dataset}/{part}.root`, one directory per dataset), and the same names are
+  created in every job before the worker starts (`output_directories`, a
+  `mkdir -p` in the job prologue), so a worker that handled no partition of a
+  dataset still has something to send. After the worker jobs have exited, the
+  backend checks with `xrdfs` that every file listed in the writer manifests is
+  at the destination with the recorded size and adler32; the result is
+  `summary["delivery"]`, and a file that is missing or differs makes the run
+  fail with a warning per file (`_dask/_output_delivery.py`).
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as
@@ -67,6 +95,13 @@ It does not own backend-neutral workflow semantics:
 - Packed Pixi prefix mode currently resolves `source='current'`, packs the
   active prefix with `conda-pack`, validates imports before submit, and records
   manifests under Flow build paths.
+- `execution.environment.type: shared-prefix` runs workers from the absolute
+  `bin/python` of an existing prefix (`prefix:` path or `current`) on a shared
+  filesystem such as AFS. Nothing is packed or transferred; it requires
+  staging mode `shared`. Preparation fails before submit if the prefix is
+  missing, node-local (`/tmp`, ...) or cannot import the worker packages, and
+  the manifest records editable sources with git revision and dirty state.
+  Do not change the prefix or its editable sources while workers run.
 - Staging mode `shared` assumes workers can see shared paths. Staging mode
   `transfer` creates transfer inputs such as `compile.tar.gz`, `prefix.tar.gz`,
   `bootstrap.sh` and optional `editable-snapshot.tar.gz`.

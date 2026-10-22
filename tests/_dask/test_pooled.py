@@ -30,6 +30,7 @@ from fasthep_distributed._dask._worker_env import (
     discover_editable_distributions,
     installed_package_records,
     pack_relocatable_prefix,
+    prepare_shared_prefix_environment,
     prepare_staged_execution_files,
     prepare_worker_environment,
     resolve_pixi_prefix,
@@ -1075,3 +1076,171 @@ def test_htcondor_job_script_streaming_is_explicit_opt_in(tmp_path: Path) -> Non
 
     assert "Stream_Output = True" in script
     assert "stream_error" not in script.lower()
+
+
+def _fake_shared_prefix(tmp_path: Path) -> Path:
+    prefix = tmp_path / "shared" / "env"
+    (prefix / "bin").mkdir(parents=True)
+    python = prefix / "bin" / "python"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    return prefix
+
+
+def _patch_shared_prefix_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    editables: list[EditableDistribution] | None = None,
+) -> list[list[str]]:
+    verified: list[list[str]] = []
+    # pytest's tmp_path is under /tmp, which the check rightly rejects.
+    monkeypatch.setattr("fasthep_distributed._dask._worker_env._NODE_LOCAL_ROOTS", ())
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env.discover_editable_distributions",
+        lambda prefix: list(editables or []),
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env.required_fasthep_imports",
+        lambda prefix, editables: ["distributed", "hepflow"],
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env.verify_source_prefix_imports",
+        lambda prefix, *, required_imports: verified.append(required_imports),
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env.installed_package_records",
+        lambda prefix: [{"name": "fasthep-flow", "version": "1.0.0", "editable": True}],
+    )
+    return verified
+
+
+def test_shared_prefix_environment_uses_prefix_python_without_transfers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = _fake_shared_prefix(tmp_path)
+    source = tmp_path / "shared" / "src" / "flow"
+    source.mkdir(parents=True)
+    verified = _patch_shared_prefix_checks(
+        monkeypatch,
+        [EditableDistribution(name="fasthep-flow", version="1.0.0", source_path=source)],
+    )
+
+    prepared = prepare_worker_environment(
+        {"environment": {"type": "shared-prefix", "prefix": str(prefix)}},
+        build_paths=BuildPaths(root=tmp_path / "build"),
+    )
+
+    assert prepared is not None
+    assert prepared.python == str(prefix / "bin" / "python")
+    assert prepared.transfer_files == []
+    assert prepared.environment_archive is None
+    assert verified == [["distributed", "hepflow"]]
+    script = "\n".join(prepared.bootstrap_commands)
+    # dask-jobqueue joins the prologue with "; ": every command must stand alone.
+    joined = "; ".join(prepared.bootstrap_commands)
+    assert all("\n" not in command for command in prepared.bootstrap_commands)
+    assert subprocess.run(["bash", "-n", "-c", joined], check=False).returncode == 0
+    assert f"export PATH='{prefix / 'bin'}'" in script
+    assert "distributed.cli.dask_worker --help" in script
+    assert "importlib.import_module" in script
+    manifest = json.loads(prepared.environment_manifest.read_text(encoding="utf-8"))
+    assert manifest["type"] == "shared-prefix"
+    assert manifest["prefix"] == str(prefix)
+    assert manifest["worker_python"] == str(prefix / "bin" / "python")
+    assert manifest["editables"][0]["source_path"] == str(source)
+    assert "vcs" in manifest["editables"][0]
+
+
+def test_shared_prefix_current_uses_active_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = _fake_shared_prefix(tmp_path)
+    _patch_shared_prefix_checks(monkeypatch)
+    monkeypatch.setattr("fasthep_distributed._dask._worker_env.sys.prefix", str(prefix))
+
+    prepared = prepare_shared_prefix_environment(
+        "current", staging_mode="shared", build_paths=BuildPaths(root=tmp_path / "b")
+    )
+
+    assert prepared.python == str(prefix.resolve() / "bin" / "python")
+
+
+@pytest.mark.parametrize(
+    ("make_prefix", "error", "message"),
+    [
+        (lambda p: p / "missing", FileNotFoundError, "does not exist"),
+        (lambda p: p, FileNotFoundError, "no executable Python"),
+    ],
+)
+def test_shared_prefix_rejects_missing_or_unusable_prefix(
+    tmp_path: Path,
+    make_prefix: Any,
+    error: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error, match=message):
+        prepare_shared_prefix_environment(
+            str(make_prefix(tmp_path)),
+            staging_mode="shared",
+            build_paths=BuildPaths(root=tmp_path / "build"),
+        )
+
+
+def test_shared_prefix_rejects_node_local_prefix_and_editables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = _fake_shared_prefix(tmp_path)
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env._NODE_LOCAL_ROOTS", (tmp_path,)
+    )
+    with pytest.raises(ValueError, match="local to each node"):
+        prepare_shared_prefix_environment(
+            str(local), staging_mode="shared", build_paths=BuildPaths(root=tmp_path / "b")
+        )
+
+    source = tmp_path / "src" / "flow"
+    source.mkdir(parents=True)
+    _patch_shared_prefix_checks(
+        monkeypatch,
+        [EditableDistribution(name="fasthep-flow", version="1", source_path=source)],
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env._NODE_LOCAL_ROOTS", (tmp_path / "src",)
+    )
+    with pytest.raises(ValueError, match="editable fasthep-flow"):
+        prepare_shared_prefix_environment(
+            str(local), staging_mode="shared", build_paths=BuildPaths(root=tmp_path / "b")
+        )
+
+
+def test_shared_prefix_fails_before_submit_when_imports_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = _fake_shared_prefix(tmp_path)
+    _patch_shared_prefix_checks(monkeypatch)
+
+    def fail(prefix: Path, *, required_imports: list[str]) -> None:
+        raise RuntimeError("failed worker import preflight")
+
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._worker_env.verify_source_prefix_imports", fail
+    )
+
+    with pytest.raises(RuntimeError, match="failed worker import preflight"):
+        prepare_shared_prefix_environment(
+            str(prefix), staging_mode="shared", build_paths=BuildPaths(root=tmp_path / "b")
+        )
+
+
+def test_shared_prefix_requires_shared_staging(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"staging\.mode 'shared'"):
+        prepare_worker_environment(
+            {
+                "environment": {"type": "shared-prefix", "prefix": str(tmp_path)},
+                "staging": {"mode": "transfer"},
+            },
+            build_paths=BuildPaths(root=tmp_path / "build"),
+        )

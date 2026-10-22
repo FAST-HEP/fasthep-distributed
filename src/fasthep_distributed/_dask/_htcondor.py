@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import errno
+import shlex
+import socket
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from hepflow.build_layout import BuildPaths
 
 from fasthep_distributed._dask._common import compute_with_client
+from fasthep_distributed._dask._htcondor_shutdown import (
+    DEFAULT_WORKER_SHUTDOWN_GRACE,
+    cluster_job_ids,
+    shutdown_htcondor_workers,
+)
 from fasthep_distributed._dask._pooled import DaskPooledHTCondorCluster
 from fasthep_distributed._dask._pools import (
     DaskWorkerPool,
@@ -31,6 +41,10 @@ _HTCONDOR_FIXED_DIRECTIVES = {
     "transfer_output_files": '""',
 }
 _HTCONDOR_RUNTIME_DIRECTIVES = {"Output", "Error", "Log"}
+_SCHEDULER_OPTION_KEYS = {"host", "port", "dashboard_address", "interface", "protocol"}
+# Sentinel resolved on the submit host when the cluster starts, so compiled
+# plans do not record a particular interactive node.
+SCHEDULER_HOST_FQDN = "fqdn"
 
 
 def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
@@ -50,6 +64,8 @@ def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
     return {
         "workers": first_pool.workers,
         "worker_start_timeout": _worker_start_timeout(config),
+        "worker_shutdown_grace": _worker_shutdown_grace(config),
+        "scheduler_options": _scheduler_options(config),
         "cluster_options": first_options,
         "pool_specs": pool_specs,
         "scale": scale,
@@ -92,6 +108,31 @@ def compute_with_htcondor(
     build_paths: BuildPaths,
     progress: Any | None = None,
 ) -> tuple[list[Any], str | None, dict[str, Any]]:
+    with htcondor_client(
+        execution=execution,
+        build_paths=build_paths,
+        progress=progress,
+    ) as (client, htcondor_config):
+        if progress is not None:
+            progress.phase_started("executing")
+        results, dashboard_link = compute_with_client(client, tasks)
+        return results, dashboard_link, htcondor_config
+
+
+@contextmanager
+def htcondor_client(
+    *,
+    execution: dict[str, Any],
+    build_paths: BuildPaths,
+    progress: Any | None = None,
+) -> Iterator[tuple[Any, dict[str, Any]]]:
+    """
+    Start HTCondor workers, wait for them, and yield a connected client.
+
+    Shared by plan execution and the Dask worker probe, so that the probe
+    exercises the production start-up path.
+    """
+
     try:
         import dask_jobqueue  # noqa: F401, PLC0415
     except ModuleNotFoundError as exc:
@@ -100,6 +141,8 @@ def compute_with_htcondor(
     from distributed import Client  # noqa: PLC0415
 
     htcondor_config = normalize_dask_htcondor_config(execution)
+    scheduler_options = resolve_scheduler_options(htcondor_config["scheduler_options"])
+    check_scheduler_port(scheduler_options)
     pool_specs = _prepare_htcondor_pool_specs(
         htcondor_config["pool_specs"],
         execution=execution,
@@ -107,7 +150,10 @@ def compute_with_htcondor(
         progress=progress,
     )
 
-    cluster = DaskPooledHTCondorCluster(pools=pool_specs)
+    cluster = DaskPooledHTCondorCluster(
+        pools=pool_specs,
+        scheduler_options=scheduler_options,
+    )
     client = Client(cluster)
     try:
         cluster.scale(htcondor_config["scale"])
@@ -118,13 +164,54 @@ def compute_with_htcondor(
             timeout=float(htcondor_config["worker_start_timeout"]),
             build_paths=build_paths,
         )
-        if progress is not None:
-            progress.phase_started("executing")
-        results, dashboard_link = compute_with_client(client, tasks)
-        return results, dashboard_link, htcondor_config
+        yield client, htcondor_config
     finally:
+        # Let the workers and their jobs exit on their own before the cluster
+        # removes them: removed jobs deliver no output files and no logs.
+        htcondor_config["shutdown"] = shutdown_htcondor_workers(
+            client,
+            logs_dir=_htcondor_execution_paths(build_paths)["logs"],
+            reported_job_ids=cluster_job_ids(cluster),
+            grace=float(htcondor_config["worker_shutdown_grace"]),
+        )
         client.close()
         cluster.close()
+
+
+def resolve_scheduler_options(options: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(options)
+    if resolved.get("host") == SCHEDULER_HOST_FQDN:
+        resolved["host"] = socket.getfqdn()
+    return resolved
+
+
+def check_scheduler_port(options: dict[str, Any]) -> None:
+    """
+    Fail before submitting workers if the fixed scheduler port is taken.
+
+    On shared interactive nodes (e.g. lxplus, port 8786) another user's
+    scheduler may already hold the port; ports are per node, not per user.
+    """
+
+    port = options.get("port")
+    if not port:
+        return
+    host = str(options.get("host") or "")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        # Like the scheduler's own listener: connections in TIME_WAIT from a
+        # previous run must not count as the port being in use.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, int(port)))
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            node = host or socket.getfqdn()
+            raise RuntimeError(
+                f"Dask scheduler port {port} is already in use on {node}. Only one "
+                "scheduler per node can use a fixed port; run from another node or "
+                "choose a different execution.config.scheduler_options.port."
+            ) from exc
 
 
 def _prepare_htcondor_pool_specs(
@@ -204,9 +291,13 @@ def _prepare_htcondor_pool_specs_impl(
             )
             spec["job_kwargs"] = job_kwargs
         job_kwargs["submit_directory"] = str(_dask_htcondor_dir(build_paths, "submit"))
+        pool_directives = dict(job_kwargs.get("job_extra_directives") or {})
+        bootstrap_directives = _htcondor_bootstrap_directives(paths)
+        if _has_output_destination(pool_directives):
+            bootstrap_directives.pop("transfer_output_files")
         job_kwargs["job_extra_directives"] = _merge_htcondor_directives(
-            dict(job_kwargs.get("job_extra_directives") or {}),
-            _htcondor_bootstrap_directives(paths),
+            pool_directives,
+            bootstrap_directives,
             f"HTCondor worker pool {name!r}",
         )
     preparation_progress.complete(
@@ -316,9 +407,45 @@ def _htcondor_cluster_options(
     if log_directory is not None:
         cluster_options["log_directory"] = log_directory
 
+    nanny = config.get("nanny")
+    if nanny is not None:
+        if not isinstance(nanny, bool):
+            raise ValueError("execution.config.nanny must be a boolean")
+        cluster_options["nanny"] = nanny
+
+    submit_command_extra = config.get("submit_command_extra")
+    if submit_command_extra is not None:
+        if not isinstance(submit_command_extra, list) or not all(
+            isinstance(item, str) for item in submit_command_extra
+        ):
+            raise ValueError(
+                "execution.config.submit_command_extra must be a list of strings"
+            )
+        cluster_options["submit_command_extra"] = list(submit_command_extra)
+
     job_extra_directives: dict[str, Any] = dict(_HTCONDOR_FIXED_DIRECTIVES)
     if config.get("queue") is not None:
         job_extra_directives["+JobFlavour"] = f'"{config["queue"]}"'
+    # Site-specific ClassAds (e.g. CERN's MY.IsDaskWorker) come from site
+    # profiles. They are kept apart from job_extra_directives so that a
+    # workflow setting its own directives does not drop them, since Flow merges
+    # execution.config only one level deep. User directives win on conflicts.
+    if config.get("site_directives") is not None:
+        site_directives = config["site_directives"]
+        if not isinstance(site_directives, dict):
+            raise ValueError("execution.config.site_directives must be a mapping")
+        job_extra_directives = _merge_htcondor_directives(
+            job_extra_directives,
+            site_directives,
+            "execution.config.site_directives",
+        )
+    output_directives = _output_transfer_directives(config)
+    if output_directives:
+        job_extra_directives = _merge_htcondor_directives(
+            job_extra_directives,
+            output_directives,
+            "execution.config.output_destination",
+        )
     if config.get("job_extra_directives") is not None:
         raw_directives = config["job_extra_directives"]
         if not isinstance(raw_directives, dict):
@@ -334,9 +461,16 @@ def _htcondor_cluster_options(
         cluster_options["job_extra_directives"] = job_extra_directives
 
     worker_extra_args = _worker_extra_args(config.get("worker_extra_args"))
+    worker_extra_args.extend(
+        _worker_port_args(config.get("worker_port_range"), nanny=nanny is not False)
+    )
     worker_extra_args.extend(dask_worker_resource_args(dask_resources))
     if worker_extra_args:
         cluster_options["worker_extra_args"] = worker_extra_args
+
+    prologue = _output_directory_prologue(config)
+    if prologue:
+        cluster_options["job_script_prologue"] = prologue
 
     return cluster_options
 
@@ -359,6 +493,17 @@ def _worker_start_timeout(config: dict[str, Any]) -> float:
     if timeout <= 0:
         raise ValueError("execution.config.worker_start_timeout must be positive")
     return timeout
+
+
+def _worker_shutdown_grace(config: dict[str, Any]) -> float:
+    raw = config.get("worker_shutdown_grace", DEFAULT_WORKER_SHUTDOWN_GRACE)
+    try:
+        grace = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution.config.worker_shutdown_grace must be numeric") from exc
+    if grace < 0:
+        raise ValueError("execution.config.worker_shutdown_grace must not be negative")
+    return grace
 
 
 def _wait_for_htcondor_workers(
@@ -401,13 +546,17 @@ def _merge_htcondor_directives(
     source: str,
 ) -> dict[str, Any]:
     merged = dict(base)
-    fixed_by_lower = {key.lower(): key for key in _HTCONDOR_FIXED_DIRECTIVES}
+    fixed_directives = dict(_HTCONDOR_FIXED_DIRECTIVES)
+    if _has_output_destination(base) or _has_output_destination(overlay):
+        # With an output destination the files to send are chosen by the user.
+        fixed_directives.pop("transfer_output_files")
+    fixed_by_lower = {key.lower(): key for key in fixed_directives}
     runtime_by_lower = {key.lower(): key for key in _HTCONDOR_RUNTIME_DIRECTIVES}
     for key, value in overlay.items():
         key_lower = str(key).lower()
         fixed_key = fixed_by_lower.get(key_lower)
         if fixed_key is not None:
-            expected = _HTCONDOR_FIXED_DIRECTIVES[fixed_key]
+            expected = fixed_directives[fixed_key]
             if str(value) != expected:
                 raise ValueError(
                     f"{source} cannot override HTCondor invariant {fixed_key}={expected}"
@@ -421,12 +570,148 @@ def _merge_htcondor_directives(
     return merged
 
 
+def _has_output_destination(directives: dict[str, Any]) -> bool:
+    return any(str(key).lower() == "output_destination" for key in directives)
+
+
+def _output_transfer_directives(config: dict[str, Any]) -> dict[str, str]:
+    """
+    HTCondor directives for sending job output files to a remote destination.
+
+    ``execution.config.output_destination`` is an XRootD URL; at CERN this uses
+    the EOS file-transfer plugin (Kerberos). ``execution.config.output_files``
+    lists what to send, relative to the job directory. HTCondor copies these
+    when the job exits, so outputs of a long-lived worker arrive only then.
+    """
+
+    destination = config.get("output_destination")
+    files = config.get("output_files")
+    if destination is None:
+        if files is not None:
+            raise ValueError(
+                "execution.config.output_files requires execution.config.output_destination"
+            )
+        return {}
+    if not isinstance(destination, str) or not destination.startswith(
+        ("root://", "xroot://")
+    ):
+        raise ValueError("execution.config.output_destination must be a root:// URL")
+    if "/eos/" not in destination:
+        raise ValueError(
+            "execution.config.output_destination must point into /eos/ "
+            "(the CERN file-transfer plugin only supports EOS)"
+        )
+    if not isinstance(files, list) or not files:
+        raise ValueError(
+            "execution.config.output_files must be a non-empty list of names "
+            "when execution.config.output_destination is set"
+        )
+    _validate_relative_names(files, "execution.config.output_files")
+    return {
+        "output_destination": destination,
+        "transfer_output_files": ", ".join(files),
+        "should_transfer_files": "YES",
+        "when_to_transfer_output": "ON_EXIT",
+        "MY.XRDCP_CREATE_DIR": "True",
+    }
+
+
+def _validate_relative_names(items: list[Any], key: str) -> None:
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{key} entries must be non-empty strings")
+        parts = Path(item).parts
+        if (
+            Path(item).is_absolute()
+            or any(part in {"", ".", ".."} for part in parts)
+            or any(ch in item for ch in ", \t\n\"'")
+        ):
+            raise ValueError(
+                f"{key} entry {item!r} must be a simple relative path in the job "
+                "directory"
+            )
+
+
+def _output_directory_prologue(config: dict[str, Any]) -> list[str]:
+    """
+    ``mkdir`` lines creating ``execution.config.output_directories`` in the job
+    directory before the worker starts.
+
+    HTCondor is told to send these directories; a worker that never wrote into
+    one would otherwise have nothing to send. One command per line: dask-jobqueue
+    joins the prologue with ``;``.
+    """
+
+    directories = config.get("output_directories")
+    if directories is None:
+        return []
+    if config.get("output_destination") is None:
+        raise ValueError(
+            "execution.config.output_directories requires "
+            "execution.config.output_destination"
+        )
+    if not isinstance(directories, list):
+        raise ValueError("execution.config.output_directories must be a list of names")
+    _validate_relative_names(directories, "execution.config.output_directories")
+    return [f"mkdir -p -- {shlex.quote(item)}" for item in directories]
+
+
 def _worker_extra_args(raw: Any) -> list[str]:
     if raw is None:
         return []
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
         raise ValueError("execution.config.worker_extra_args must be a list of strings")
     return list(raw)
+
+
+def _scheduler_options(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("scheduler_options")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("execution.config.scheduler_options must be a mapping")
+    unknown = sorted(str(key) for key in raw if key not in _SCHEDULER_OPTION_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unsupported execution.config.scheduler_options: " + ", ".join(unknown)
+        )
+    port = raw.get("port")
+    if port is not None and (
+        isinstance(port, bool) or not isinstance(port, int) or not 0 <= port < 65536
+    ):
+        raise ValueError(
+            "execution.config.scheduler_options.port must be a port number"
+        )
+    return dict(raw)
+
+
+def _worker_port_args(raw: Any, *, nanny: bool) -> list[str]:
+    """
+    Render a site's open port range for the worker and, if enabled, its nanny.
+
+    Kept as a dedicated option so that a workflow's own worker_extra_args do not
+    replace the range set by a site profile.
+    """
+
+    if raw is None:
+        return []
+    port_range = str(raw)
+    bounds = port_range.split(":")
+    if (
+        isinstance(raw, bool)
+        or len(bounds) > 2
+        or not all(item.isdigit() for item in bounds)
+        or not all(0 < int(item) < 65536 for item in bounds)
+        or (len(bounds) == 2 and int(bounds[0]) > int(bounds[1]))
+    ):
+        raise ValueError(
+            "execution.config.worker_port_range must be a port or a range "
+            f"'low:high', got {raw!r}"
+        )
+    args = ["--worker-port", port_range]
+    if nanny:
+        args.extend(["--nanny-port", port_range])
+    return args
 
 
 def _pool_summary(pool: DaskWorkerPool) -> dict[str, Any]:

@@ -8,6 +8,12 @@ from hepflow.backends.model import BackendResult
 from hepflow.build_layout import BuildPaths
 from hepflow.model.plan import ExecutionNode, ExecutionPartition, ExecutionPlan
 from hepflow.progress import ProgressReporter
+from hepflow.registry.loaders import runtime_registry_from_config
+from hepflow.runtime.boundary import (
+    boundary_products_to_value_store,
+    extract_boundary_products,
+    plan_partition_boundary,
+)
 from hepflow.runtime.engine import (
     _register_product_bindings,
     build_dataset_context,
@@ -25,6 +31,13 @@ from hepflow.runtime.materialize import materialize_final_products
 from hepflow.runtime.provenance import ensure_runtime_provenance
 from hepflow.runtime.writer_manifests import write_writer_manifests
 
+from fasthep_distributed._dask._output_delivery import (
+    delivered_writer_records,
+    execution_with_output_roots,
+    output_destination,
+    partition_task_context,
+    verify_delivery,
+)
 from fasthep_distributed._dask._pools import dask_resources_for_resource
 
 
@@ -60,10 +73,18 @@ class DaskBackend:
             ctx=base_ctx,
             registry_cfg=plan.registry,
         )
+        execution = plan.execution
+        partition_ctx: dict[str, Any] = {}
+        if strategy == "htcondor":
+            # With an output destination, workers write below their job directory
+            # and HTCondor sends the files to EOS when the worker job exits.
+            execution = execution_with_output_roots(plan, plan.execution)
+            partition_ctx = partition_task_context(execution)
         tasks = build_dask_graph(
             plan,
             base_ctx=base_ctx,
             initial_values=global_side_values,
+            partition_ctx=partition_ctx,
         )
 
         try:
@@ -80,7 +101,7 @@ class DaskBackend:
                 ).compute_with_htcondor
                 task_results, dashboard_link, strategy_config = compute_with_htcondor(
                     tasks,
-                    execution=plan.execution,
+                    execution=execution,
                     build_paths=BuildPaths.from_ctx(base_ctx),
                     progress=reporter,
                 )
@@ -102,6 +123,18 @@ class DaskBackend:
                     dask_config=dask_config,
                     build_paths=BuildPaths.from_ctx(base_ctx),
                 )
+
+            delivery: dict[str, Any] | None = None
+            destination = output_destination(execution) if partition_ctx else None
+            if destination is not None:
+                # The worker jobs have exited, so HTCondor has sent their files.
+                if reporter is not None:
+                    reporter.phase_started("verifying_outputs")
+                delivery = verify_delivery(
+                    delivered_writer_records(task_results), destination
+                )
+                if reporter is not None:
+                    reporter.phase_completed("verifying_outputs")
 
             if reporter is not None:
                 for partition in plan.partitions:
@@ -126,6 +159,9 @@ class DaskBackend:
                 dashboard_link=dashboard_link,
             )
 
+            if delivery is not None:
+                _record_delivery(result, delivery)
+
             if reporter is not None:
                 reporter.phase_completed("finalizing")
                 reporter.run_completed()
@@ -148,14 +184,48 @@ class DaskBackend:
                     }
 
 
+def _record_delivery(result: BackendResult, delivery: dict[str, Any]) -> None:
+    """Add the delivery check to the summary; a file that did not arrive fails the run."""
+
+    result.summary["delivery"] = delivery
+    result.summary.setdefault("backend", {})["delivery"] = delivery
+    if delivery["complete"]:
+        return
+    result.success = False
+    warnings = result.summary.setdefault("warnings", [])
+    if delivery["expected"] == 0:
+        warnings.append(
+            {
+                "kind": "output_delivery",
+                "message": "no writer output was reported, nothing to deliver",
+            }
+        )
+    for problem in delivery["problems"]:
+        warnings.append(
+            {
+                "kind": "output_delivery",
+                "message": f"{problem['path']}: {problem['status']}",
+                "detail": {
+                    key: value
+                    for key, value in problem.items()
+                    if key not in {"path", "status"}
+                },
+            }
+        )
+
+
 def build_dask_graph(
     plan: ExecutionPlan,
     *,
     base_ctx: dict[str, Any],
     initial_values: dict[tuple[str, str], Any] | None = None,
+    partition_ctx: dict[str, Any] | None = None,
 ) -> list[Any]:
     from dask import delayed  # noqa: PLC0415
 
+    # Entries that only partition tasks get; final nodes run on the client with
+    # base_ctx, whose output directory is the shared build directory.
+    task_ctx = {**base_ctx, **dict(partition_ctx or {})}
     tasks: list[Any] = []
     annotations = _dask_resource_annotations_for_plan(plan)
     for partition in plan.partitions:
@@ -169,7 +239,7 @@ def build_dask_graph(
                 task = delayed(_execute_partition_task)(
                     plan,
                     partition,
-                    base_ctx=base_ctx,
+                    base_ctx=task_ctx,
                     registry_cfg=plan.registry,
                     initial_values=initial_values,
                 )
@@ -177,7 +247,7 @@ def build_dask_graph(
             task = delayed(_execute_partition_task)(
                 plan,
                 partition,
-                base_ctx=base_ctx,
+                base_ctx=task_ctx,
                 registry_cfg=plan.registry,
                 initial_values=initial_values,
             )
@@ -236,7 +306,13 @@ def compute_with_client(client: Any, tasks: list[Any]) -> tuple[list[Any], str |
     if not tasks:
         return [], dashboard_link
     futures = client.compute(tasks)
-    return list(client.gather(futures)), dashboard_link
+    try:
+        return list(client.gather(futures)), dashboard_link
+    finally:
+        # Release the results on the workers now. Workers that still hold data
+        # refuse to retire, and the shutdown fallback then removes their jobs
+        # before HTCondor has sent their output.
+        client.cancel(futures)
 
 
 def compute_with_scheduler(
@@ -476,6 +552,20 @@ def _execute_partition_task(
     )
     for key in dict(initial_values or {}):
         value_store.pop(key, None)
+    # Return what crosses the partition boundary, as the local backend does,
+    # not every node's event stream: serialising those separately takes a
+    # worker past 20 GB on a 100k-event file.
+    runtime_registry = runtime_registry_from_config(registry_cfg or plan.registry)
+    value_store = boundary_products_to_value_store(
+        extract_boundary_products(
+            plan,
+            value_store,
+            partition=partition,
+            boundary=plan_partition_boundary(plan, runtime_registry=runtime_registry),
+            runtime_registry=runtime_registry,
+            ctx=partition_ctx,
+        )
+    )
     partition_ctx["_hook_summary"] = hook_manager.usage_summary()
     partition_meta = partition.to_context()
     for warning in warnings:
@@ -502,10 +592,27 @@ def _merge_hook_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
             )
             if key not in merged:
                 order.append(key)
-                merged[key] = dict(item)
+                merged[key] = {k: v for k, v in item.items() if k != "results"}
                 merged[key]["calls"] = 0
             merged[key]["calls"] += int(item.get("calls") or 0)
+            _merge_hook_results(merged[key], item.get("results"))
     return {"enabled": [merged[key] for key in order]}
+
+
+def _merge_hook_results(target: dict[str, Any], results: Any) -> None:
+    """Append list results and update mapping results across partitions."""
+    if not isinstance(results, dict):
+        return
+    if not isinstance(target.get("results"), dict):
+        target["results"] = {}
+    merged = target["results"]
+    for name, value in results.items():
+        if isinstance(value, list):
+            merged[name] = [*(merged.get(name) or []), *value]
+        elif isinstance(value, dict):
+            merged[name] = {**(merged.get(name) or {}), **value}
+        else:
+            merged[name] = value
 
 
 def _as_bool(value: Any) -> bool:

@@ -118,8 +118,35 @@ def test_worker_config_is_json_ready() -> None:
         "prefix": "/afs/example/env",
         "imports": {"required": ["hepflow"], "optional": ["fasthep"]},
         "paths": [{"name": "work", "path": "/afs/work", "required": True}],
-        "timeouts": {"imports": 300.0, "paths": 5.0, "git": 60.0, "scratch": 60.0},
+        "xrootd": [],
+        "eos_write": [],
+        "output_files": [],
+        "timeouts": {
+            "imports": 300.0,
+            "paths": 5.0,
+            "git": 60.0,
+            "scratch": 60.0,
+            "xrootd": 300.0,
+            "eos_write": 300.0,
+            "output_files": 60.0,
+        },
     }
+
+
+def test_xrootd_specs_are_validated() -> None:
+    config = probe_config_from_mapping(
+        _raw(xrootd=[{"name": "nano", "url": "root://host//f.root", "expect_size": 7}])
+    )
+    assert config.worker_config("p")["xrootd"] == [
+        {"name": "nano", "url": "root://host//f.root", "required": True, "expect_size": 7}
+    ]
+    for bad in (
+        [{"name": "x", "url": "/local/file"}],
+        [{"name": "x", "url": "root://h//f", "expect_size": "7"}],
+        [{"name": "a", "url": "root://h//f"}, {"name": "a", "url": "root://h//g"}],
+    ):
+        with pytest.raises(ProbeConfigError):
+            probe_config_from_mapping(_raw(xrootd=bad))
 
 
 def test_load_probe_config_reads_yaml(tmp_path: Path) -> None:
@@ -141,3 +168,49 @@ def test_load_probe_config_rejects_non_mapping(tmp_path: Path) -> None:
 
     with pytest.raises(ProbeConfigError, match="must be a mapping"):
         load_probe_config(path)
+
+
+def test_eos_write_specs_are_validated() -> None:
+    config = probe_config_from_mapping(
+        _raw(eos_write=[{"name": "t", "url": "root://eosuser.cern.ch//eos/user/x/t"}])
+    )
+    assert config.worker_config("p")["eos_write"] == [
+        {
+            "name": "t",
+            "url": "root://eosuser.cern.ch//eos/user/x/t",
+            "required": True,
+            "size_bytes": 1048576,
+        }
+    ]
+    for bad in (
+        [{"name": "t", "url": "/eos/user/x"}],
+        [{"name": "t", "url": "root://h//d", "size_bytes": 0}],
+    ):
+        with pytest.raises(ProbeConfigError):
+            probe_config_from_mapping(_raw(eos_write=bad))
+
+
+def test_output_files_specs_are_validated() -> None:
+    config = probe_config_from_mapping(
+        _raw(output_files=[{"name": "t", "subdir": "dataset_a"}])
+    )
+    assert config.worker_config("p")["output_files"] == [
+        {"name": "t", "subdir": "dataset_a", "size_bytes": 65536, "shared_name": None}
+    ]
+    for bad in (
+        [{"name": "t", "subdir": "../x"}],
+        [{"name": "t", "subdir": "a/b"}],
+        [{"name": "t", "subdir": "a", "size_bytes": 0}],
+    ):
+        with pytest.raises(ProbeConfigError):
+            probe_config_from_mapping(_raw(output_files=bad))
+
+
+def test_kill_workers_is_validated() -> None:
+    raw = _raw(dask={"kill_workers": 1})
+    dask = probe_config_from_mapping(raw).dask
+    assert dask is not None
+    assert dask.kill_workers == 1
+    for bad in (-1, 1.5, True):
+        with pytest.raises(ProbeConfigError):
+            probe_config_from_mapping(_raw(dask={"kill_workers": bad}))

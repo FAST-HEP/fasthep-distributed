@@ -44,6 +44,9 @@ DEFAULT_TIMEOUTS = {
     "paths": 30.0,
     "git": 60.0,
     "scratch": 60.0,
+    "xrootd": 300.0,
+    "eos_write": 300.0,
+    "output_files": 60.0,
 }
 
 # Environment variables that are safe and useful to record. The environment is
@@ -271,6 +274,188 @@ def check_path(path: str) -> CheckResult:
     return PASS, detail
 
 
+def x509_proxy_record() -> dict[str, Any]:
+    """Describe the X509 proxy the job sees: its path and state, never contents."""
+
+    raw = os.environ.get("X509_USER_PROXY")
+    if not raw:
+        return {"env_set": False}
+    proxy = Path(raw)
+    record: dict[str, Any] = {"env_set": True, "path": raw, "exists": proxy.is_file()}
+    if record["exists"]:
+        record["mode"] = oct(proxy.stat().st_mode & 0o777)
+    return record
+
+
+def check_xrootd(url: str, expect_size: int | None, timeout: float) -> CheckResult:
+    """Copy one file over XRootD into job scratch and check its size."""
+
+    xrdcp = shutil.which("xrdcp")
+    detail: dict[str, Any] = {
+        "url": url,
+        "xrdcp": xrdcp,
+        "x509_proxy": x509_proxy_record(),
+    }
+    if xrdcp is None:
+        detail["error"] = "xrdcp not found on PATH"
+        return FAIL, detail
+    scratch = os.environ.get("_CONDOR_SCRATCH_DIR") or str(Path.cwd())
+    target = Path(scratch) / f".fasthep-probe-xrootd-{os.getpid()}"
+    start = time.monotonic()
+    try:
+        result = subprocess.run(
+            [xrdcp, "--silent", "--force", url, str(target)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        detail["returncode"] = result.returncode
+        detail["seconds"] = round(time.monotonic() - start, 3)
+        if result.returncode != 0:
+            detail["error"] = (result.stderr or result.stdout).strip()[-500:]
+            return FAIL, detail
+        size = target.stat().st_size
+        detail["size_bytes"] = size
+        if expect_size is not None and size != expect_size:
+            detail["expected_size_bytes"] = expect_size
+            detail["error"] = f"read {size} bytes, expected {expect_size}"
+            return FAIL, detail
+    finally:
+        target.unlink(missing_ok=True)
+    return PASS, detail
+
+
+def credential_hints() -> dict[str, Any]:
+    """Which credential mechanisms the job environment offers, by name only."""
+
+    creds_dir = os.environ.get("_CONDOR_CREDS")
+    return {
+        "krb5ccname_set": bool(os.environ.get("KRB5CCNAME")),
+        "condor_creds_dir": creds_dir,
+        "condor_creds_entries": (
+            sorted(item.name for item in Path(creds_dir).iterdir())
+            if creds_dir and Path(creds_dir).is_dir()
+            else []
+        ),
+        "x509_proxy": x509_proxy_record(),
+    }
+
+
+def check_eos_write(
+    directory_url: str, size_bytes: int, timeout: float
+) -> CheckResult:
+    """
+    Publish a file to EOS the way production will: ``xrdcp`` to a temporary
+    name, ``xrdfs mv`` to the final name, check the size, then remove it.
+    """
+
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    parts = urlsplit(directory_url)
+    detail: dict[str, Any] = {
+        "directory_url": directory_url,
+        "credentials": credential_hints(),
+        "steps": {},
+    }
+    xrdcp, xrdfs = shutil.which("xrdcp"), shutil.which("xrdfs")
+    if xrdcp is None or xrdfs is None or not parts.hostname:
+        detail["error"] = "xrdcp/xrdfs not on PATH or URL has no host"
+        return FAIL, detail
+    server, base = f"{parts.scheme}://{parts.netloc}", parts.path.rstrip("/")
+    unique = f"{socket.gethostname()}-{os.getpid()}"
+    temp_path = f"{base}/.fasthep-probe-{unique}.tmp"
+    final_path = f"{base}/fasthep-probe-{unique}.bin"
+    scratch = os.environ.get("_CONDOR_SCRATCH_DIR") or str(Path.cwd())
+    source = Path(scratch) / f".fasthep-probe-eos-{os.getpid()}"
+    source.write_bytes(os.urandom(size_bytes))
+    published = False
+
+    def run(step: str, command: list[str]) -> bool:
+        start = time.monotonic()
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        detail["steps"][step] = {
+            "returncode": result.returncode,
+            "seconds": round(time.monotonic() - start, 3),
+        }
+        if result.returncode != 0:
+            detail["error"] = f"{step}: " + (result.stderr or result.stdout).strip()[-400:]
+        detail["_last_stdout"] = result.stdout
+        return result.returncode == 0
+
+    try:
+        if not run(
+            "copy_temp",
+            [xrdcp, "--silent", "--force", "--path", str(source), f"{server}/{temp_path}"],
+        ):
+            return FAIL, detail
+        if not run("rename", [xrdfs, server, "mv", temp_path, final_path]):
+            return FAIL, detail
+        published = True
+        if not run("stat", [xrdfs, server, "stat", final_path]):
+            return FAIL, detail
+        match = [ln for ln in detail["_last_stdout"].splitlines() if ln.startswith("Size:")]
+        remote_size = int(match[0].split()[1]) if match else None
+        detail["remote_size_bytes"] = remote_size
+        if remote_size != size_bytes:
+            detail["error"] = f"remote size {remote_size}, expected {size_bytes}"
+            return FAIL, detail
+    finally:
+        source.unlink(missing_ok=True)
+        detail.pop("_last_stdout", None)
+        for leftover in ([final_path] if published else [temp_path, final_path]):
+            subprocess.run(
+                [xrdfs, server, "rm", leftover],
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+    return PASS, detail
+
+
+def check_output_files(
+    subdir: str, size_bytes: int, shared_name: str | None = None
+) -> CheckResult:
+    """
+    Write files into the job directory for HTCondor ``output_destination`` tests.
+
+    Creates ``<subdir>/<host>-<random>_0.root`` (unique per job, what a skim
+    partition would write), optionally ``<subdir>/<shared_name>`` with different
+    content in every job (to see what happens when two jobs write the same name)
+    and a top-level decoy ``flat-<random>.bin`` that a ``transfer_output_files``
+    list naming only ``subdir`` should not send. Names, sizes and hashes are
+    recorded so that what arrives on EOS can be compared. Process ids are not
+    unique across jobs, so they are not used in names.
+    """
+
+    scratch = Path(os.environ.get("_CONDOR_SCRATCH_DIR") or Path.cwd())
+    token = os.urandom(4).hex()
+    host = socket.gethostname().split(".")[0]
+    relatives = [f"{subdir}/{host}-{token}_0.root", f"flat-{token}.bin"]
+    if shared_name:
+        relatives.insert(1, f"{subdir}/{shared_name}")
+    written: list[dict[str, Any]] = []
+    for relative in relatives:
+        target = scratch / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = os.urandom(size_bytes)
+        target.write_bytes(payload)
+        written.append(
+            {
+                "path": relative,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+    return PASS, {
+        "scratch": str(scratch),
+        "host": socket.gethostname(),
+        "files": written,
+    }
+
+
 def check_scratch() -> CheckResult:
     scratch = os.environ.get("_CONDOR_SCRATCH_DIR") or str(Path.cwd())
     usage = shutil.disk_usage(scratch)
@@ -369,7 +554,48 @@ def run_checks(config: Mapping[str, Any], *, mode: str) -> list[dict[str, Any]]:
                 timeout=timeouts["paths"],
             )
         )
+    for spec in config.get("xrootd", []):
+        checks.append(
+            run_check(
+                f"xrootd.{spec['name']}",
+                partial(
+                    check_xrootd,
+                    str(spec["url"]),
+                    spec.get("expect_size"),
+                    timeouts["xrootd"],
+                ),
+                required=bool(spec.get("required", True)),
+                timeout=timeouts["xrootd"] + 30.0,
+            )
+        )
+    for spec in config.get("eos_write", []):
+        checks.append(
+            run_check(
+                f"eos_write.{spec['name']}",
+                partial(
+                    check_eos_write,
+                    str(spec["url"]),
+                    int(spec.get("size_bytes", 1024 * 1024)),
+                    timeouts["eos_write"],
+                ),
+                required=bool(spec.get("required", True)),
+                timeout=timeouts["eos_write"] * 4 + 30.0,
+            )
+        )
     if mode == "worker":
+        for spec in config.get("output_files", []):
+            checks.append(
+                run_check(
+                    f"output_files.{spec['name']}",
+                    partial(
+                        check_output_files,
+                        str(spec["subdir"]),
+                        int(spec.get("size_bytes", 65536)),
+                        spec.get("shared_name"),
+                    ),
+                    timeout=timeouts["output_files"],
+                )
+            )
         checks.append(run_check("scratch", check_scratch, timeout=timeouts["scratch"]))
     return checks
 

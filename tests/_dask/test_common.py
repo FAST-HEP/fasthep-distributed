@@ -9,7 +9,9 @@ from typing import Any, cast
 import pytest
 from hepflow.model.plan import ExecutionNode, ExecutionPartition, ExecutionPlan
 
+from fasthep_distributed._dask import _common
 from fasthep_distributed._dask._common import (
+    _execute_partition_task,
     build_dask_graph,
     compute_with_client,
     dask_resource_annotations_for_node,
@@ -34,9 +36,17 @@ def test_compute_with_client_uses_client_compute_and_gather() -> None:
             calls["futures"] = futures
             return [{"ok": True}]
 
+        def cancel(self, futures: list[Any]) -> None:
+            calls["cancelled"] = futures
+
     results, dashboard_link = compute_with_client(FakeClient(), ["task"])
 
-    assert calls == {"tasks": ["task"], "futures": ["future"]}
+    # The results are released on the workers right after they are gathered.
+    assert calls == {
+        "tasks": ["task"],
+        "futures": ["future"],
+        "cancelled": ["future"],
+    }
     assert results == [{"ok": True}]
     assert dashboard_link == "http://scheduler.example/status"
 
@@ -237,6 +247,33 @@ def test_build_dask_graph_applies_annotations_to_required_tasks(
     assert records == [{"resources": {"resource.gpu": 1, "GPU": 1}}]
 
 
+def test_build_dask_graph_gives_only_partition_tasks_the_partition_ctx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_delayed(func: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> None:
+            seen.append(dict(kwargs["base_ctx"]))
+
+        return wrapper
+
+    dask = types.ModuleType("dask")
+    cast(Any, dask).delayed = fake_delayed
+    monkeypatch.setitem(sys.modules, "dask", dask)
+    plan = ExecutionPlan()
+    plan.partitions = [_partition()]
+    base_ctx = {"outdir": "/shared/build"}
+
+    build_dask_graph(
+        plan, base_ctx=base_ctx, partition_ctx={"output_files_root": "."}
+    )
+
+    assert seen == [{"outdir": "/shared/build", "output_files_root": "."}]
+    # Final nodes use base_ctx on the client, which must not move its files.
+    assert base_ctx == {"outdir": "/shared/build"}
+
+
 def test_build_dask_graph_skips_annotations_without_required_resources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,6 +328,44 @@ def test_build_dask_graph_ignores_modifier_metadata(
 
     assert tasks[0]["annotations"] == {}
     assert records == [{}]
+
+
+def test_partition_task_returns_only_boundary_products(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = ExecutionPlan()
+    for node_id, outputs in (
+        ("read", {"stream": "event_stream"}),
+        ("stage", {"stream": "event_stream", "cutflow": "cutflow"}),
+    ):
+        plan.add_node(
+            ExecutionNode(
+                id=node_id,
+                graph_node_id=node_id,
+                role="source" if node_id == "read" else "transform",
+                impl=f"toy.{node_id}",
+                outputs=outputs,
+            )
+        )
+    store = {
+        ("read", "stream"): "raw events",
+        ("stage", "stream"): "selected events",
+        ("stage", "cutflow"): {"rows": 1},
+    }
+    monkeypatch.setattr(_common, "execute_plan_partition", lambda *a, **k: dict(store))
+    registry = {
+        "product_handlers": {
+            "cutflow": {"boundary": {"retain": True, "representation": "value"}}
+        }
+    }
+
+    result = _execute_partition_task(
+        plan, _partition(), base_ctx={}, registry_cfg=registry
+    )
+
+    # Event streams are not retained: serialising every node's stream separately
+    # took Dask workers past their memory limit.
+    assert result["value_store"] == {("stage", "cutflow"): {"rows": 1}}
 
 
 def _plan_with_node_execution(

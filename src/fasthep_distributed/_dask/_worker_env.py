@@ -24,6 +24,9 @@ from hepflow.utils import write_json
 from fasthep_distributed.probe._worker import installed_package_records, vcs_state
 
 DISTRIBUTED_PREPARATION_PHASE = "Preparing distributed execution"
+# Roots that exist on every node but are not shared between them, so a prefix
+# there is not the same prefix on the workers.
+_NODE_LOCAL_ROOTS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
 
 
 @dataclass(slots=True, frozen=True)
@@ -168,6 +171,13 @@ def prepare_worker_environment(
     plan = worker_environment_plan_from_execution(execution)
     if plan is None:
         return None
+    if plan.type == "shared-prefix":
+        return prepare_shared_prefix_environment(
+            plan.prefix or "current",
+            staging_mode=_staging_mode(execution),
+            build_paths=build_paths,
+            progress=progress,
+        )
     if plan.type != "packed-pixi":
         return None
     if plan.mode != "prefix":
@@ -312,6 +322,126 @@ def prepare_worker_environment(
         bootstrap_script=bootstrap_path,
         editable_snapshot_archive=editable_snapshot.archive if editable_snapshot else None,
     )
+
+
+def prepare_shared_prefix_environment(
+    prefix_source: str,
+    *,
+    staging_mode: str,
+    build_paths: BuildPaths,
+    progress: DistributedPreparationProgress | None = None,
+) -> PreparedWorkerEnvironment:
+    """
+    Run workers directly from a prefix on a shared filesystem (e.g. AFS).
+
+    Nothing is packed or transferred: workers call the prefix's Python by its
+    absolute path. The prefix and any editable sources must therefore be visible
+    at the same paths on the workers, and must not change while workers run.
+    Fails before submit if the prefix is missing, node-local or cannot import
+    the worker packages.
+    """
+
+    if staging_mode != "shared":
+        raise ValueError(
+            "execution.environment.type 'shared-prefix' requires "
+            "execution.staging.mode 'shared'; workers use the shared compile and "
+            "environment paths directly"
+        )
+    if progress is not None:
+        progress.step("checking_shared_prefix", prefix=prefix_source)
+    prefix = resolve_shared_prefix(prefix_source)
+    python = prefix / "bin" / "python"
+
+    editables = discover_editable_distributions(prefix)
+    for editable in editables:
+        _require_shared_location(editable.source_path, f"editable {editable.name}")
+    required_imports = required_fasthep_imports(prefix, editables)
+    verify_source_prefix_imports(prefix, required_imports=required_imports)
+
+    environment_id = _environment_id("shared-prefix", prefix)
+    environment_dir = build_paths.worker_environments_dir() / environment_id
+    environment_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = environment_dir / "manifest.json"
+    editable_records = [
+        {
+            "name": item.name,
+            "version": item.version,
+            "source_path": str(item.source_path),
+            "vcs": vcs_state(item.source_path),
+        }
+        for item in editables
+    ]
+    write_json(
+        {
+            "type": "shared-prefix",
+            "mode": "shared",
+            "source": prefix_source,
+            "prefix": str(prefix),
+            "resolved_prefix": str(prefix.resolve()),
+            "packages": installed_package_records(prefix),
+            "editables": editable_records,
+            "environment_id": environment_id,
+            "worker_python": str(python),
+            "required_imports": required_imports,
+        },
+        manifest_path,
+    )
+    return PreparedWorkerEnvironment(
+        python=str(python),
+        bootstrap_commands=_shared_prefix_bootstrap_commands(prefix, required_imports),
+        transfer_files=[],
+        env={},
+        environment_manifest=manifest_path,
+    )
+
+
+def resolve_shared_prefix(source: str) -> Path:
+    """Return the absolute prefix workers should use, or raise if unsuitable."""
+
+    if not source.strip():
+        raise ValueError("Shared prefix must be non-empty")
+    prefix = Path(sys.prefix).resolve() if source == "current" else Path(source)
+    if not prefix.is_absolute():
+        raise ValueError(f"Shared prefix must be an absolute path, got {source!r}")
+    if not prefix.is_dir():
+        raise FileNotFoundError(f"Shared prefix does not exist: {prefix}")
+    python = prefix / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise FileNotFoundError(f"Shared prefix has no executable Python: {python}")
+    _require_shared_location(prefix, "prefix")
+    return prefix
+
+
+def _require_shared_location(path: Path, what: str) -> None:
+    resolved = path.resolve()
+    for root in _NODE_LOCAL_ROOTS:
+        if resolved == root or root in resolved.parents:
+            raise ValueError(
+                f"Shared-prefix {what} {path} is under {root}, which is local to "
+                "each node; use a path on a shared filesystem such as AFS"
+            )
+
+
+def _shared_prefix_bootstrap_commands(
+    prefix: Path, required_imports: list[str]
+) -> list[str]:
+    """Job prologue: fail fast, with a readable log, if a worker cannot use the prefix."""
+
+    python = _shell_quote(str(prefix / "bin" / "python"))
+    imports = "; ".join(
+        ["import importlib", f"[importlib.import_module(n) for n in {required_imports!r}]"]
+    )
+    return [
+        "set -e",
+        f"echo '[fasthep] using shared prefix {prefix}'",
+        f'export PATH={_shell_quote(str(prefix / "bin"))}"${{PATH:+:$PATH}}"',
+        # One line per command: jobqueue joins the prologue with "; ".
+        f'[ -x {python} ] || {{ echo "[fasthep] shared prefix Python is not visible on $(hostname):" {python} >&2; exit 1; }}',
+        f"{python} --version",
+        f"{python} -c {_shell_quote(imports)}",
+        f"{python} -m distributed.cli.dask_worker --help >/dev/null",
+        "echo '[fasthep] launching dask worker'",
+    ]
 
 
 def resolve_pixi_prefix(source: str = "current") -> Path:
