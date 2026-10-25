@@ -141,14 +141,13 @@ def run_dask_probe(
 def resolve_probe_execution(config: ProbeConfig) -> dict[str, Any]:
     """Resolve ``dask.use`` profiles and ``dask.execution`` the way Flow does."""
 
+    from hepflow.compiler.context import CompileContext  # noqa: PLC0415
     from hepflow.compiler.execution import resolve_workflow_execution  # noqa: PLC0415
 
     assert config.dask is not None
     workflow = {"use": config.dask.use, "execution": config.dask.execution}
-    resolved = resolve_workflow_execution(
-        workflow,
-        workflow_path=config.dask.base_dir / "probe.yaml",
-    )["execution"]
+    context = CompileContext.from_workflow_path(config.dask.base_dir / "probe.yaml")
+    resolved = resolve_workflow_execution(workflow, context=context)["execution"]
     execution: dict[str, Any] = dict(resolved)
     exec_config = dict(execution.get("config") or {})
     if (
