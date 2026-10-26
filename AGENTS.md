@@ -197,3 +197,11 @@ or docs-environment behavior.
   as manual or integration validation outside the default unit suite.
 - For broad backend-contract changes, run `pixi run check`; for narrow Python
   changes, run the smallest relevant tests plus `pixi run lint`.
+
+## Documentation and Changelog
+
+User-facing changes — new features, behavior changes, bug fixes, breaking changes — must add an
+entry to `CHANGELOG.md` under `## [Unreleased]`, in the matching [Keep a
+Changelog](https://keepachangelog.com/en/1.1.0/) category (Added, Changed, Deprecated, Removed,
+Fixed, Security). Changes that affect public APIs, CLI behaviour, or user-facing workflows should
+also update the relevant page under `docs/`.
