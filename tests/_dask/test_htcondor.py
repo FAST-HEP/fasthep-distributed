@@ -21,6 +21,7 @@ from fasthep_distributed._dask._htcondor import (
     _wait_for_htcondor_workers,
     check_scheduler_port,
     compute_with_htcondor,
+    htcondor_client,
     normalize_dask_htcondor_config,
     resolve_scheduler_options,
 )
@@ -273,7 +274,11 @@ def test_htcondor_cluster_scales_workers_and_computes_tasks(
 
     class FakePooledHTCondorCluster:
         def __init__(
-            self, *, pools: dict[str, Any], scheduler_options: dict[str, Any]
+            self,
+            *,
+            pools: dict[str, Any],
+            scheduler_options: dict[str, Any],
+            name_prefix: str = "",
         ) -> None:
             calls["pools"] = pools
             calls["scheduler_options"] = scheduler_options
@@ -426,7 +431,11 @@ def test_htcondor_timeout_closes_client_and_cluster(
 
     class FakePooledHTCondorCluster:
         def __init__(
-            self, *, pools: dict[str, Any], scheduler_options: dict[str, Any]
+            self,
+            *,
+            pools: dict[str, Any],
+            scheduler_options: dict[str, Any],
+            name_prefix: str = "",
         ) -> None:
             calls["cluster"] = self
             self.closed = False
@@ -1106,3 +1115,67 @@ def test_check_scheduler_port_ignores_time_wait() -> None:
         client.close()
 
     check_scheduler_port({"host": "127.0.0.1", "port": port})
+
+
+def test_htcondor_batch_name_defaults_to_none_and_reads_config() -> None:
+    execution = {"backend": "dask", "strategy": "htcondor", "config": {}}
+    assert normalize_dask_htcondor_config(execution)["batch_name"] is None
+
+    execution["config"] = {"batch_name": "chip-jec"}
+    assert normalize_dask_htcondor_config(execution)["batch_name"] == "chip-jec"
+
+
+@pytest.mark.parametrize("value", ["", "  ", 3, "a b"])
+def test_htcondor_batch_name_must_be_a_simple_label(value: Any) -> None:
+    execution = {
+        "backend": "dask",
+        "strategy": "htcondor",
+        "config": {"batch_name": value},
+    }
+
+    with pytest.raises(ValueError, match="batch_name"):
+        normalize_dask_htcondor_config(execution)
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [({}, "my-run-"), ({"batch_name": "chip-jec"}, "chip-jec-")],
+)
+def test_htcondor_workers_are_named_after_batch_name_or_outdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config: dict[str, Any],
+    expected: str,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    class StopHere(Exception):
+        pass
+
+    class FakeCluster:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+            raise StopHere
+
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._htcondor.DaskPooledHTCondorCluster", FakeCluster
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._htcondor.check_scheduler_port", lambda _o: None
+    )
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._htcondor._prepare_htcondor_pool_specs",
+        lambda specs, **_kw: specs,
+    )
+    outdir = tmp_path / "my-run"
+
+    with (
+        pytest.raises(StopHere),
+        htcondor_client(
+            execution={"backend": "dask", "strategy": "htcondor", "config": config},
+            build_paths=BuildPaths(root=outdir),
+        ),
+    ):
+        pass
+
+    assert seen["name_prefix"] == expected

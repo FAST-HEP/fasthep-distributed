@@ -12,6 +12,9 @@ Add new entries under `## [Unreleased]`, in the category they belong to. At rele
 
 ### Added
 
+- `execution.config.batch_name` names the HTCondor workers of a run, so their batch names in
+  `condor_q` differ between concurrent runs (`<batch_name>-default-0`, ...). It defaults to the
+  basename of the output directory.
 - A probe tool to validate distributed-execution readiness at a site before submitting real jobs,
   covering CERN-specific HTCondor recommendations, XRootD reads, EOS writes, and output transfer
   verification.

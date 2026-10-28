@@ -1244,3 +1244,22 @@ def test_shared_prefix_requires_shared_staging(tmp_path: Path) -> None:
             },
             build_paths=BuildPaths(root=tmp_path / "build"),
         )
+
+
+def test_pooled_cluster_worker_names_carry_the_name_prefix() -> None:
+    cluster = FakePooledCluster(
+        pools=_pool_config(), name_prefix="run-a-", start=False
+    )
+
+    assert sorted(cluster.worker_spec) == [
+        "run-a-default-0",
+        "run-a-default-1",
+        "run-a-high_memory-0",
+    ]
+    assert cluster._worker_pool["run-a-default-0"] == "default"
+
+
+def test_pooled_cluster_worker_names_are_unchanged_without_a_prefix() -> None:
+    cluster = FakePooledCluster(pools=_pool_config(), start=False)
+
+    assert "default-0" in cluster.worker_spec

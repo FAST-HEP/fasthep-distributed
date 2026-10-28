@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import re
 import shlex
 import socket
 from collections.abc import Iterator
@@ -63,6 +64,7 @@ def normalize_dask_htcondor_config(execution: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "workers": first_pool.workers,
+        "batch_name": _batch_name(config),
         "worker_start_timeout": _worker_start_timeout(config),
         "worker_shutdown_grace": _worker_shutdown_grace(config),
         "scheduler_options": _scheduler_options(config),
@@ -150,9 +152,11 @@ def htcondor_client(
         progress=progress,
     )
 
+    batch_name = htcondor_config["batch_name"] or build_paths.root.name
     cluster = DaskPooledHTCondorCluster(
         pools=pool_specs,
         scheduler_options=scheduler_options,
+        name_prefix=f"{batch_name}-" if batch_name else "",
     )
     client = Client(cluster)
     try:
@@ -482,6 +486,18 @@ def _validate_htcondor_config_options(config: dict[str, Any]) -> None:
             "backend. Use execution.config.queue for site job flavours or "
             "execution.config.job_extra_directives for explicit HTCondor ClassAds."
         )
+
+
+def _batch_name(config: dict[str, Any]) -> str | None:
+    raw = config.get("batch_name")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", raw):
+        raise ValueError(
+            "execution.config.batch_name must be a label of letters, digits, "
+            f"'.', '_' and '-', got {raw!r}"
+        )
+    return raw
 
 
 def _worker_start_timeout(config: dict[str, Any]) -> float:

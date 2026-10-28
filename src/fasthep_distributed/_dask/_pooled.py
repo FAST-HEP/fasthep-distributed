@@ -44,6 +44,7 @@ class DaskPooledCluster(SpecCluster):
         *,
         pools: dict[str, dict[str, Any]],
         job_kwargs: dict[str, Any] | None = None,
+        name_prefix: str = "",
         schedd_class: type[Any] = Scheduler,
         scheduler_options: dict[str, Any] | None = None,
         asynchronous: bool = False,
@@ -55,6 +56,9 @@ class DaskPooledCluster(SpecCluster):
             job_kwargs=job_kwargs,
         )
         self.scheduler_options = dict(scheduler_options or {})
+        # Worker names are also the HTCondor batch names, so a prefix keeps the
+        # jobs of concurrent runs apart in condor_q.
+        self.name_prefix = name_prefix
         self._pooled_started = start
         self._worker_pool: dict[str, str] = {}
         job_cls = self.resolve_job_cls()
@@ -117,7 +121,7 @@ class DaskPooledCluster(SpecCluster):
                 allow_zero=True,
             )
             for idx in range(worker_count):
-                worker_name = f"{pool.name}-{idx}"
+                worker_name = f"{self.name_prefix}{pool.name}-{idx}"
                 specs[worker_name] = {
                     "cls": job_cls,
                     "options": dict(pool.job_kwargs),
