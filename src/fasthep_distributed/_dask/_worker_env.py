@@ -10,7 +10,7 @@ import sysconfig
 import tarfile
 import tempfile
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -547,6 +547,7 @@ def prepare_staged_execution_files(
     *,
     build_paths: BuildPaths,
     staging: Mapping[str, Any] | None = None,
+    datasets: Sequence[str] | None = None,
 ) -> StagedExecutionFiles | None:
     if prepared is None:
         return None
@@ -561,13 +562,14 @@ def prepare_staged_execution_files(
             env=dict(prepared.env),
             manifest=prepared.environment_manifest,
         )
-    return prepare_transfer_staging(prepared, build_paths=build_paths)
+    return prepare_transfer_staging(prepared, build_paths=build_paths, datasets=datasets)
 
 
 def prepare_transfer_staging(
     prepared: PreparedWorkerEnvironment,
     *,
     build_paths: BuildPaths,
+    datasets: Sequence[str] | None = None,
 ) -> StagedExecutionFiles:
     staging_dir = build_paths.staging_dir()
     if staging_dir.exists():
@@ -580,7 +582,7 @@ def prepare_transfer_staging(
     bootstrap_script = staging_dir / "bootstrap.sh"
     manifest_path = staging_dir / "manifest.json"
 
-    build_compile_bundle(build_paths.compile_dir(), compile_archive)
+    build_compile_bundle(build_paths.compile_dir(), compile_archive, datasets=datasets)
     if prepared.environment_archive is None or prepared.bootstrap_script is None:
         raise ValueError("Prepared worker environment is missing environment artifacts")
     shutil.copy2(prepared.environment_archive, environment_archive)
@@ -649,7 +651,19 @@ def distributed_preparation_size_summary(
     }
 
 
-def build_compile_bundle(compile_dir: Path, output_file: Path) -> Path:
+def build_compile_bundle(
+    compile_dir: Path,
+    output_file: Path,
+    datasets: Sequence[str] | None = None,
+) -> Path:
+    """Tar the compile files a worker job carries.
+
+    A flat compile directory (``datasets`` None) contributes the files it holds under the
+    fixed names below. A per-dataset compile directory holds the shared files at the top
+    and one unit ``datasets/<name>/`` per dataset; with ``datasets`` the bundle carries the
+    shared files and exactly those units, complete (a unit that is missing is an error, so a
+    job never starts against a compile that was not finished).
+    """
     required = [
         "plan.yaml",
         "normalized.yaml",
@@ -658,12 +672,24 @@ def build_compile_bundle(compile_dir: Path, output_file: Path) -> Path:
         "dataset_metadata.json",
         "worker_environment.json",
     ]
+    units = list(dict.fromkeys(datasets or []))
+    for name in units:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError(f"Dataset name {name!r} cannot name a unit directory")
+        unit = compile_dir / "datasets" / name
+        if not (unit / "manifest.yaml").is_file():
+            raise FileNotFoundError(
+                f"No complete dataset unit {unit} (manifest.yaml is missing); "
+                f"run `compile --dataset {name}` first."
+            )
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output_file, "w:gz") as archive:
         for name in required:
             path = compile_dir / name
             if path.exists():
                 archive.add(path, arcname=name)
+        for name in units:
+            archive.add(compile_dir / "datasets" / name, arcname=f"datasets/{name}")
     return output_file
 
 
