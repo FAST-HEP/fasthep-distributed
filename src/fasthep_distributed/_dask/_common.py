@@ -41,6 +41,18 @@ from fasthep_distributed._dask._output_delivery import (
 from fasthep_distributed._dask._pools import dask_resources_for_resource
 
 
+def _unit_datasets(plan: ExecutionPlan) -> dict[str, Any]:
+    """The ``datasets`` keyword of a per-dataset plan, so the worker bundle carries its units.
+
+    A plan assembled from dataset units names its manifest template in
+    ``execution.partitioning.manifest``; the units are those of the datasets it runs. Other
+    plans pass nothing, so the compile bundle stays flat.
+    """
+    if not dict(plan.execution.get("partitioning") or {}).get("manifest"):
+        return {}
+    return {"datasets": sorted({partition.dataset for partition in plan.partitions})}
+
+
 class DaskBackend:
     """
     Partition-granular Dask backend with pluggable worker provisioning strategies.
@@ -104,6 +116,7 @@ class DaskBackend:
                     execution=execution,
                     build_paths=BuildPaths.from_ctx(base_ctx),
                     progress=reporter,
+                    **_unit_datasets(plan),
                 )
             elif strategy == "slurm":
                 compute_with_slurm = import_module(

@@ -4,7 +4,7 @@ import errno
 import re
 import shlex
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -109,11 +109,13 @@ def compute_with_htcondor(
     execution: dict[str, Any],
     build_paths: BuildPaths,
     progress: Any | None = None,
+    datasets: Sequence[str] | None = None,
 ) -> tuple[list[Any], str | None, dict[str, Any]]:
     with htcondor_client(
         execution=execution,
         build_paths=build_paths,
         progress=progress,
+        datasets=datasets,
     ) as (client, htcondor_config):
         if progress is not None:
             progress.phase_started("executing")
@@ -127,9 +129,13 @@ def htcondor_client(
     execution: dict[str, Any],
     build_paths: BuildPaths,
     progress: Any | None = None,
+    datasets: Sequence[str] | None = None,
 ) -> Iterator[tuple[Any, dict[str, Any]]]:
     """
     Start HTCondor workers, wait for them, and yield a connected client.
+
+    ``datasets`` names the dataset units of a per-dataset compile that the transfer bundle
+    carries (see ``build_compile_bundle``); None keeps the flat compile directory.
 
     Shared by plan execution and the Dask worker probe, so that the probe
     exercises the production start-up path.
@@ -150,6 +156,7 @@ def htcondor_client(
         execution=execution,
         build_paths=build_paths,
         progress=progress,
+        datasets=datasets,
     )
 
     batch_name = htcondor_config["batch_name"] or build_paths.root.name
@@ -224,6 +231,7 @@ def _prepare_htcondor_pool_specs(
     execution: dict[str, Any],
     build_paths: BuildPaths,
     progress: Any | None = None,
+    datasets: Sequence[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     staging_mode = str(dict(execution.get("staging") or {}).get("mode") or "shared")
     preparation_progress = DistributedPreparationProgress(progress)
@@ -238,6 +246,7 @@ def _prepare_htcondor_pool_specs(
             build_paths=build_paths,
             preparation_progress=preparation_progress,
             staging_mode=staging_mode,
+            datasets=datasets,
         )
     except BaseException as exc:
         preparation_progress.fail(exc)
@@ -251,6 +260,7 @@ def _prepare_htcondor_pool_specs_impl(
     build_paths: BuildPaths,
     preparation_progress: DistributedPreparationProgress,
     staging_mode: str,
+    datasets: Sequence[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     prepared = {
         name: {"workers": spec["workers"], "job_kwargs": dict(spec["job_kwargs"])}
@@ -269,6 +279,7 @@ def _prepare_htcondor_pool_specs_impl(
         worker_environment,
         build_paths=build_paths,
         staging=dict(execution.get("staging") or {}),
+        datasets=datasets,
     )
     preparation_progress.step(
         "ready_to_submit_workers",

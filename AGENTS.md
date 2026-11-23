@@ -105,6 +105,10 @@ It does not own backend-neutral workflow semantics:
 - Staging mode `shared` assumes workers can see shared paths. Staging mode
   `transfer` creates transfer inputs such as `compile.tar.gz`, `prefix.tar.gz`,
   `bootstrap.sh` and optional `editable-snapshot.tar.gz`.
+  For a per-dataset Flow plan (`execution.partitioning.manifest` is set) `DaskBackend` passes the
+  datasets it runs and `compile.tar.gz` carries the shared compile files plus exactly those
+  `datasets/<name>/` units (`build_compile_bundle(..., datasets=...)`); a missing unit fails before
+  submit. Other plans keep the flat bundle.
 - Never put credential contents in plans, manifests or logs. X509 proxy support
   should pass file paths to scheduler transfer and set worker environment
   variables in the job prologue.
