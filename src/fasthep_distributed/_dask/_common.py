@@ -32,10 +32,12 @@ from hepflow.runtime.provenance import ensure_runtime_provenance
 from hepflow.runtime.writer_manifests import write_writer_manifests
 
 from fasthep_distributed._dask._output_delivery import (
-    delivered_writer_records,
+    delivered_files,
+    delivery_statuses,
     execution_with_output_roots,
     output_destination,
     partition_task_context,
+    record_delivery,
     verify_delivery,
 )
 from fasthep_distributed._dask._pools import dask_resources_for_resource
@@ -143,9 +145,9 @@ class DaskBackend:
                 # The worker jobs have exited, so HTCondor has sent their files.
                 if reporter is not None:
                     reporter.phase_started("verifying_outputs")
-                delivery = verify_delivery(
-                    delivered_writer_records(task_results), destination
-                )
+                files = delivered_files(task_results, destination)
+                delivery = verify_delivery(files, destination)
+                record_delivery(task_results, delivery_statuses(files, delivery))
                 if reporter is not None:
                     reporter.phase_completed("verifying_outputs")
 

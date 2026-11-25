@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from hepflow.build_layout import partition_output_roots
 from hepflow.model.io import ArtifactManifest, ArtifactReference
 from hepflow.model.plan import ExecutionPlan
+from hepflow.runtime.artifacts import apply_delivery_status
 
 # Workers write below their working directory, which is the HTCondor job
 # directory, and HTCondor sends files from there.
@@ -66,25 +67,62 @@ def partition_task_context(execution: dict[str, Any]) -> dict[str, str]:
     if destination is None:
         return {}
     return {
-        "output_files_root": WORKER_FILES_ROOT,
+        "artifact_root": WORKER_FILES_ROOT,
         "output_destination": destination,
     }
 
 
-def delivered_writer_records(task_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Manifest records of the files that partition tasks wrote below the files root."""
+def delivered_files(
+    task_results: list[dict[str, Any]], destination: str
+) -> list[dict[str, Any]]:
+    """
+    The files Flow recorded at the destination: their ``path`` below it, recorded
+    ``uri``, ``size_bytes`` and ``adler32``.
 
-    records: list[dict[str, Any]] = []
+    Flow records a file a worker wrote below its job directory as the destination
+    URI joined with its path, so the files to check are the references whose
+    location starts with the destination.
+    """
+
+    prefix = destination.rstrip("/") + "/"
+    files: list[dict[str, Any]] = []
     for item in task_results:
         for value in dict(item.get("value_store") or {}).values():
             for reference in _references(value):
-                manifest = reference.metadata.get("writer_manifest")
-                if (
-                    isinstance(manifest, dict)
-                    and manifest.get("path_type") == "relative_to_files_root"
-                ):
-                    records.append(dict(manifest))
-    return records
+                if reference.uri.startswith(prefix):
+                    files.append(
+                        {
+                            "path": reference.uri.removeprefix(prefix),
+                            "uri": reference.uri,
+                            "size_bytes": reference.size_bytes,
+                            "adler32": reference.adler32,
+                        }
+                    )
+    return files
+
+
+def delivery_statuses(
+    files: list[dict[str, Any]], summary: dict[str, Any]
+) -> dict[str, str]:
+    """Per-file status by recorded location: ``ok`` unless the check listed a problem."""
+
+    problems = {str(item["path"]): str(item["status"]) for item in summary["problems"]}
+    return {
+        str(item["uri"]): problems.get(str(item["path"]), "ok") for item in files
+    }
+
+
+def record_delivery(
+    task_results: list[dict[str, Any]], statuses: dict[str, str]
+) -> None:
+    """Hand the per-file statuses to Flow, which records them on each file's reference."""
+
+    for item in task_results:
+        for value in dict(item.get("value_store") or {}).values():
+            for reference in _references(value):
+                status = statuses.get(reference.uri)
+                if status is not None:
+                    apply_delivery_status(reference, {reference.uri: status})
 
 
 def verify_delivery(

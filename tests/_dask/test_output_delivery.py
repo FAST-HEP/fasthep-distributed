@@ -9,10 +9,12 @@ from hepflow.model.plan import ExecutionNode, ExecutionPartition, ExecutionPlan
 
 from fasthep_distributed._dask._htcondor import normalize_dask_htcondor_config
 from fasthep_distributed._dask._output_delivery import (
-    delivered_writer_records,
+    delivered_files,
+    delivery_statuses,
     execution_with_output_roots,
     output_destination,
     partition_task_context,
+    record_delivery,
     split_destination,
     verify_delivery,
 )
@@ -85,7 +87,7 @@ def test_partition_task_context_points_writers_at_the_job_directory() -> None:
     execution = _execution(output_destination=DESTINATION)
 
     assert partition_task_context(execution) == {
-        "output_files_root": ".",
+        "artifact_root": ".",
         "output_destination": DESTINATION,
     }
     assert output_destination(execution) == DESTINATION
@@ -137,30 +139,19 @@ def test_output_directories_are_validated(config: dict[str, Any], message: str) 
 
 
 def _record(path: str, *, size: int = 7, adler32: str | None = "0a0b0c0d") -> OutputResult:
-    manifest = {
-        "kind": "root_tree",
-        "path": path,
-        "path_type": "relative_to_files_root",
-        "size_bytes": size,
-        "dataset": path.split("/", maxsplit=1)[0],
-        "partition": 0,
-    }
-    if adler32 is not None:
-        manifest["adler32"] = adler32
+    """A file Flow recorded at its delivered location: the destination plus its path."""
     return OutputResult(
         kind="artifact",
-        path=path,
-        metadata={"writer_manifest": manifest},
+        path=DESTINATION + path,
+        size_bytes=size,
+        adler32=adler32,
         dataset_name=path.split("/", maxsplit=1)[0],
     )
 
 
-def test_delivered_writer_records_collect_files_below_the_files_root() -> None:
-    local = OutputResult(
-        kind="artifact",
-        path="x",
-        metadata={"writer_manifest": {"path": "x", "path_type": "relative_to_outdir"}},
-    )
+def test_delivered_files_collect_the_files_recorded_at_the_destination() -> None:
+    local = OutputResult(kind="artifact", path="artifacts/plots/x.png", size_bytes=3)
+    elsewhere = OutputResult(kind="artifact", path="root://other.host//eos/x.root")
     manifest = ArtifactManifest(
         product_kind="artifact",
         format="root",
@@ -173,16 +164,47 @@ def test_delivered_writer_records_collect_files_below_the_files_root() -> None:
         {"value_store": {("write.Selected", "artifact"): _record("a/0_0.root")}},
         {"value_store": {("write.Selected", "artifact"): manifest}},
         {"value_store": {("write.Selected", "artifact"): local}},
+        {"value_store": {("write.Selected", "artifact"): elsewhere}},
         {"value_store": {}},
     ]
 
-    records = delivered_writer_records(results)
+    files = delivered_files(results, DESTINATION)
 
-    assert sorted(item["path"] for item in records) == [
+    assert sorted(item["path"] for item in files) == [
         "a/0_0.root",
         "b/0_0.root",
         "b/1_0.root",
     ]
+    first = next(item for item in files if item["path"] == "a/0_0.root")
+    assert first["uri"] == DESTINATION + "a/0_0.root"
+    assert (first["size_bytes"], first["adler32"]) == (7, "0a0b0c0d")
+
+
+def test_delivery_statuses_are_ok_unless_the_check_listed_a_problem() -> None:
+    files = [
+        {"path": "a/0_0.root", "uri": DESTINATION + "a/0_0.root"},
+        {"path": "a/1_0.root", "uri": DESTINATION + "a/1_0.root"},
+    ]
+    summary = {"problems": [{"path": "a/1_0.root", "status": "size_mismatch"}]}
+
+    assert delivery_statuses(files, summary) == {
+        DESTINATION + "a/0_0.root": "ok",
+        DESTINATION + "a/1_0.root": "size_mismatch",
+    }
+
+
+def test_record_delivery_sets_the_status_on_each_reference() -> None:
+    good, bad = _record("a/0_0.root"), _record("a/1_0.root")
+    results: list[dict[str, Any]] = [
+        {"value_store": {("w", "artifact"): good}},
+        {"value_store": {("w", "artifact"): bad}},
+    ]
+
+    record_delivery(
+        results, {good.path: "ok", bad.path: "missing"}
+    )
+
+    assert (good.delivery, bad.delivery) == ("ok", "missing")
 
 
 @pytest.mark.parametrize(
@@ -220,8 +242,12 @@ class FakeXrdfs:
         return subprocess.CompletedProcess(command, 0, f"adler32 {adler32}\n", "")
 
 
-def _records(*paths: str) -> list[dict[str, Any]]:
-    return [dict(_record(path).metadata["writer_manifest"]) for path in paths]
+def _records(*paths: str, adler32: str | None = "0a0b0c0d") -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = [
+        {"value_store": {("w", "artifact"): _record(path, adler32=adler32)}}
+        for path in paths
+    ]
+    return delivered_files(results, DESTINATION)
 
 
 def test_verify_delivery_accepts_complete_output() -> None:
@@ -275,7 +301,7 @@ def test_verify_delivery_lists_missing_and_mismatching_files() -> None:
 
 
 def test_verify_delivery_without_checksum_checks_size_only() -> None:
-    record = dict(_record("a/0_0.root", adler32=None).metadata["writer_manifest"])
+    [record] = _records("a/0_0.root", adler32=None)
     xrdfs = FakeXrdfs({"/eos/user/x/y/skim/a/0_0.root": (7, "00000000")})
 
     summary = verify_delivery([record], DESTINATION, runner=xrdfs)
@@ -313,6 +339,7 @@ def _run_backend_with_fake_cluster(
 
     seen: dict[str, Any] = {}
     reference = _record("ds/0_0.root")
+    seen["references"] = [reference]
 
     def fake_graph(plan: Any, **kwargs: Any) -> list[Any]:
         seen["partition_ctx"] = kwargs["partition_ctx"]
@@ -363,13 +390,14 @@ def test_backend_delivers_to_the_destination_and_verifies_the_files(
     result, seen = _run_backend_with_fake_cluster(monkeypatch, delivery=complete)
 
     assert seen["partition_ctx"] == {
-        "output_files_root": ".",
+        "artifact_root": ".",
         "output_destination": DESTINATION,
     }
     assert seen["execution"]["config"]["output_files"] == ["ds"]
     assert seen["destination"] == DESTINATION
     assert [item["path"] for item in seen["records"]] == ["ds/0_0.root"]
     assert result.success is True
+    assert [ref.delivery for ref in seen["references"]] == ["ok"]
     assert result.summary["delivery"] == complete
     assert result.summary["backend"]["delivery"] == complete
 
@@ -385,9 +413,10 @@ def test_backend_fails_the_run_when_a_file_did_not_arrive(
         "problems": [{"path": "ds/0_0.root", "status": "missing", "message": "gone"}],
     }
 
-    result, _ = _run_backend_with_fake_cluster(monkeypatch, delivery=incomplete)
+    result, seen = _run_backend_with_fake_cluster(monkeypatch, delivery=incomplete)
 
     assert result.success is False
+    assert [ref.delivery for ref in seen["references"]] == ["missing"]
     assert result.summary["delivery"]["problems"][0]["status"] == "missing"
     [warning] = result.summary["warnings"]
     assert warning["kind"] == "output_delivery"

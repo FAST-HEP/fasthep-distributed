@@ -266,10 +266,10 @@ def test_build_dask_graph_gives_only_partition_tasks_the_partition_ctx(
     base_ctx = {"outdir": "/shared/build"}
 
     build_dask_graph(
-        plan, base_ctx=base_ctx, partition_ctx={"output_files_root": "."}
+        plan, base_ctx=base_ctx, partition_ctx={"artifact_root": "."}
     )
 
-    assert seen == [{"outdir": "/shared/build", "output_files_root": "."}]
+    assert seen == [{"outdir": "/shared/build", "artifact_root": "."}]
     # Final nodes use base_ctx on the client, which must not move its files.
     assert base_ctx == {"outdir": "/shared/build"}
 
