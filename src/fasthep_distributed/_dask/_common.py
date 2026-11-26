@@ -29,7 +29,10 @@ from hepflow.runtime.engine import (
 from hepflow.runtime.hooks.manager import HookManager
 from hepflow.runtime.materialize import materialize_final_products
 from hepflow.runtime.persistence.save import persist_boundary_products
-from hepflow.runtime.persistence.select import resolve_persistence
+from hepflow.runtime.persistence.select import (
+    global_side_product_nodes,
+    resolve_persistence,
+)
 from hepflow.runtime.products import register_product_bindings
 from hepflow.runtime.provenance import ensure_runtime_provenance
 from hepflow.runtime.writer_manifests import write_writer_manifests
@@ -91,6 +94,12 @@ class DaskBackend:
         base_ctx.setdefault("runtime_resources", {})
         resolved_resources = base_ctx.setdefault("resolved_resources", {})
         base_ctx.setdefault("resources", resolved_resources)
+        # built before any work so a configuration error surfaces first; None when off
+        persistence = (
+            ClientPersistence(plan, outdir=str(base_ctx.get("outdir") or "."))
+            if persistence_settings(plan.execution).mode != "off"
+            else None
+        )
         global_side_values = execute_global_side_product_nodes(
             plan,
             ctx=base_ctx,
@@ -103,27 +112,27 @@ class DaskBackend:
             # and HTCondor sends the files to EOS when the worker job exits.
             execution = execution_with_output_roots(plan, plan.execution)
             partition_ctx = partition_task_context(execution)
-        persistence = ClientPersistence(plan, outdir=str(base_ctx.get("outdir") or "."))
-        reused: dict[str, dict[str, Any]] = {}
-        if persistence.enabled:
-            for partition in plan.partitions:
-                restored = persistence.reuse(partition)
-                if restored is not None:
-                    reused[partition.id] = restored
-        to_run = [p for p in plan.partitions if p.id not in reused]
-        tasks = build_dask_graph(
-            plan,
-            base_ctx=base_ctx,
-            initial_values=global_side_values,
-            partition_ctx=partition_ctx,
-            **({"partitions": to_run} if reused else {}),
-        )
 
         try:
             if reporter is not None:
                 reporter.run_started(detail={"backend": "dask", "strategy": strategy})
                 if strategy != "htcondor":
                     reporter.phase_started("executing")
+
+            reused: dict[str, dict[str, Any]] = {}
+            if persistence is not None:
+                for partition in plan.partitions:
+                    restored = persistence.reuse(partition)
+                    if restored is not None:
+                        reused[partition.id] = restored
+            to_run = [p for p in plan.partitions if p.id not in reused]
+            tasks = build_dask_graph(
+                plan,
+                base_ctx=base_ctx,
+                initial_values=global_side_values,
+                partition_ctx=partition_ctx,
+                **({"partitions": to_run} if reused else {}),
+            )
 
             dashboard_link: str | None = None
             strategy_config: dict[str, Any] | None = None
@@ -160,6 +169,11 @@ class DaskBackend:
                 )
 
             if reused:
+                if len(task_results) != len(to_run):
+                    raise RuntimeError(
+                        f"the Dask strategy returned {len(task_results)} results for "
+                        f"{len(to_run)} submitted partitions"
+                    )
                 computed = iter(task_results)
                 task_results = [
                     reused[partition.id]
@@ -205,7 +219,7 @@ class DaskBackend:
 
             if delivery is not None:
                 _record_delivery(result, delivery)
-            if persistence.enabled:
+            if persistence is not None:
                 result.summary["persistence"] = persistence.summary()
 
             if reporter is not None:
@@ -616,7 +630,12 @@ def _execute_partition_task(
     if settings.mode != "off":
         boundary_products = persist_boundary_products(
             boundary_products,
-            resolve_persistence(boundary, runtime_registry, settings),
+            resolve_persistence(
+                boundary,
+                runtime_registry,
+                settings,
+                global_nodes=global_side_product_nodes(plan),
+            ),
             plan=plan,
             settings=settings,
             outdir=str(partition_ctx.get("outdir") or "."),

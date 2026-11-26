@@ -92,9 +92,9 @@ It does not own backend-neutral workflow semantics:
   submits only the other partitions; task results are merged back in plan partition order.
   The backend summary has `persistence` (`persisted`, `not_persisted`, `consumed`). The root
   must be on a filesystem shared with the client: `htcondor` and `slurm` need an absolute
-  `root`, remote roots are refused, both before any cluster starts
-  (`validate_persistence`); persisted sets are not delivered to EOS. With persistence off the
-  code path is unchanged.
+  `root` that is not node-local (`/tmp`, `/var/tmp`, `/dev/shm`), remote roots are refused, all before any cluster starts
+  (`validate_persistence`); persisted sets are not delivered to EOS. Global side products are listed as not persisted
+  (they have no partition identity). With persistence off nothing of this is built or run.
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as

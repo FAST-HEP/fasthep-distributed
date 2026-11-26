@@ -246,3 +246,135 @@ def test_unfinished_set_has_no_manifest(
         )
 
     assert not list((tmp_path / "artifacts" / "products").rglob("manifest.json"))
+
+
+# -- review fixes ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("strategy", ["htcondor", "slurm"])
+@pytest.mark.parametrize("root", ["/tmp/products", "/var/tmp/p", "/dev/shm/p"])
+def test_a_node_local_root_is_refused_on_batch_strategies(
+    strategy: str, root: str
+) -> None:
+    with pytest.raises(ValueError, match="node-local"):
+        validate_persistence(_execution(strategy, mode="all", root=root), strategy)
+
+
+def test_file_localhost_is_a_valid_absolute_root() -> None:
+    validate_persistence(
+        _execution("htcondor", mode="all", root="file://localhost/shared/p"), "htcondor"
+    )
+
+
+def test_mode_off_does_not_build_the_persistence_machinery(
+    tmp_path: Path, executed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("persistence off must not build ClientPersistence")
+
+    monkeypatch.setattr(_common, "ClientPersistence", boom)
+
+    DaskBackend().run(_plan(tmp_path), ctx={"outdir": str(tmp_path)})
+
+
+def test_a_bad_product_key_fails_before_any_work(
+    tmp_path: Path, executed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("global side products ran before the setting was checked")
+
+    monkeypatch.setattr(_common, "execute_global_side_product_nodes", boom)
+    plan = _plan(tmp_path, mode="selected", products={"stage.Typo:hist": True})
+
+    with pytest.raises(ValueError, match=r"stage\.Typo:hist"):
+        DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+
+
+class _Reporter:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.run_id = "r"
+
+        class _Counts:
+            def to_dict(self) -> dict[str, int]:
+                return {}
+
+        self.counts = _Counts()
+
+    def run_started(self, **_: Any) -> None:
+        self.events.append("run_started")
+
+    def run_failed(self, exc: BaseException) -> None:
+        self.events.append("run_failed")
+
+    def phase_started(self, *_: Any, **__: Any) -> None:
+        self.events.append("phase_started")
+
+    def phase_completed(self, *_: Any, **__: Any) -> None:
+        self.events.append("phase_completed")
+
+    def completed(self, *_: Any, **__: Any) -> None:
+        self.events.append("completed")
+
+    def close(self) -> list[Any]:
+        self.events.append("close")
+        return []
+
+
+def test_a_failure_while_reusing_is_reported_and_closes_the_reporter(
+    tmp_path: Path, executed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(self: Any, partition: Any) -> None:
+        raise RuntimeError("reuse failed")
+
+    monkeypatch.setattr(_common.ClientPersistence, "reuse", explode)
+    reporter = _Reporter()
+
+    with pytest.raises(RuntimeError, match="reuse failed"):
+        DaskBackend().run(
+            _plan(tmp_path, mode="all", reuse=True),
+            ctx={"outdir": str(tmp_path)},
+            progress=reporter,  # type: ignore[arg-type]
+        )
+
+    assert reporter.events[0] == "run_started"
+    assert "run_failed" in reporter.events
+    assert reporter.events[-1] == "close"
+
+
+def test_a_compute_function_returning_the_wrong_count_is_a_clear_error(
+    tmp_path: Path, executed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _plan(tmp_path, mode="all", reuse=True)
+    DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+    first = next(
+        (tmp_path / "artifacts" / "products").rglob("events__toy__0/manifest.json")
+    )
+    first.unlink()  # one partition left to run
+    monkeypatch.setattr(
+        "fasthep_distributed._dask._local.compute_with_local_strategy",
+        lambda tasks, **_: ([], None),
+    )
+
+    with pytest.raises(RuntimeError, match="returned 0 results for 1"):
+        DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+
+
+def test_global_side_products_are_not_persisted_per_partition(
+    tmp_path: Path, executed: list[str]
+) -> None:
+    plan = _plan(tmp_path, mode="all")
+    plan.nodes[0].input_scope = "global"
+    plan.nodes[0].output_scope = "global"
+
+    result = _execute_partition_task(
+        plan,
+        plan.partitions[0],
+        base_ctx={"outdir": str(tmp_path)},
+        registry_cfg=REGISTRY,
+    )
+
+    assert result["value_store"][("stage.Hist", "hist")] == {"entries": 1}
+    assert not (tmp_path / "artifacts" / "products").exists()
+    summary = _common.ClientPersistence(plan, outdir=str(tmp_path)).summary()
+    assert summary["not_persisted"][0]["reason"] == "global side product"

@@ -22,8 +22,14 @@ from hepflow.runtime.boundary import plan_partition_boundary
 from hepflow.runtime.persistence.evidence import EvidenceLedger
 from hepflow.runtime.persistence.reuse import reuse_partition_products
 from hepflow.runtime.persistence.save import persistence_root
-from hepflow.runtime.persistence.select import PersistenceSelection, resolve_persistence
+from hepflow.runtime.persistence.select import (
+    PersistenceSelection,
+    global_side_product_nodes,
+    resolve_persistence,
+)
 from hepflow.runtime.provenance import ProvenanceRecorder
+
+from fasthep_distributed._dask._worker_env import _NODE_LOCAL_ROOTS
 
 _BATCH_STRATEGIES = {"htcondor", "slurm"}
 
@@ -47,12 +53,23 @@ def validate_persistence(execution: Mapping[str, Any], strategy: str) -> None:
             f"execution.persistence on the {strategy} strategy needs an absolute root "
             "on a filesystem shared with the client (execution.persistence.root)"
         )
-    path = unquote(urlparse(root).path) if is_uri(root) else root
-    if not Path(path).is_absolute() or (is_uri(root) and urlparse(root).netloc):
+    parsed = urlparse(root) if is_uri(root) else None
+    path = unquote(parsed.path) if parsed else root
+    if not Path(path).is_absolute() or (
+        parsed is not None and parsed.netloc not in {"", "localhost"}
+    ):
         raise ValueError(
             f"execution.persistence.root {root!r} must be an absolute path (or "
             f"file:///absolute/path) on the {strategy} strategy"
         )
+    resolved = Path(path).resolve()
+    for local in _NODE_LOCAL_ROOTS:
+        if resolved == local or local in resolved.parents:
+            raise ValueError(
+                f"execution.persistence.root {root!r} is under {local}, which is "
+                f"node-local on the {strategy} strategy: workers would each publish "
+                "to their own copy. Use a path on a shared filesystem."
+            )
 
 
 class ClientPersistence:
@@ -65,7 +82,10 @@ class ClientPersistence:
         self.registry = runtime_registry_from_config(plan.registry)
         self.boundary = plan_partition_boundary(plan, runtime_registry=self.registry)
         self.selection: PersistenceSelection = resolve_persistence(
-            self.boundary, self.registry, self.settings
+            self.boundary,
+            self.registry,
+            self.settings,
+            global_nodes=global_side_product_nodes(plan),
         )
         self.ledger = EvidenceLedger()
 
