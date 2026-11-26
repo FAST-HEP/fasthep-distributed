@@ -85,6 +85,16 @@ It does not own backend-neutral workflow semantics:
   (`hepflow.runtime.artifacts.apply_delivery_status` through `record_delivery`) to
   be recorded on each file's record (`_dask/_output_delivery.py`). The other
   strategies assume a shared output directory and deliver nothing.
+- Product persistence (`execution.persistence`, fasthep-flow `docs/execution/persistence.md`,
+  `_dask/_persistence.py`): with `mode` `all` or `selected` the partition task saves the
+  selected boundary products on the worker with Flow's `persist_boundary_products`, and
+  with `reuse: true` the client takes published sets with `reuse_partition_products` and
+  submits only the other partitions; task results are merged back in plan partition order.
+  The backend summary has `persistence` (`persisted`, `not_persisted`, `consumed`). The root
+  must be on a filesystem shared with the client: `htcondor` and `slurm` need an absolute
+  `root`, remote roots are refused, both before any cluster starts
+  (`validate_persistence`); persisted sets are not delivered to EOS. With persistence off the
+  code path is unchanged.
 - Heterogeneous worker pools are supported for jobqueue strategies. Local Dask
   currently supports only a single default pool.
 - Resource classes in Flow execution config map to Dask worker resources such as

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from importlib import import_module
 from typing import Any
 
@@ -27,6 +28,8 @@ from hepflow.runtime.engine import (
 )
 from hepflow.runtime.hooks.manager import HookManager
 from hepflow.runtime.materialize import materialize_final_products
+from hepflow.runtime.persistence.save import persist_boundary_products
+from hepflow.runtime.persistence.select import resolve_persistence
 from hepflow.runtime.products import register_product_bindings
 from hepflow.runtime.provenance import ensure_runtime_provenance
 from hepflow.runtime.writer_manifests import write_writer_manifests
@@ -39,6 +42,11 @@ from fasthep_distributed._dask._output_delivery import (
     partition_task_context,
     record_delivery,
     verify_delivery,
+)
+from fasthep_distributed._dask._persistence import (
+    ClientPersistence,
+    persistence_settings,
+    validate_persistence,
 )
 from fasthep_distributed._dask._pools import dask_resources_for_resource
 
@@ -74,6 +82,7 @@ class DaskBackend:
         progress_warnings: list[dict[str, Any]] = []
         strategy = normalise_dask_strategy(plan.execution)
         validate_supported_dask_pools(plan.execution, strategy=strategy)
+        validate_persistence(plan.execution, strategy)
         dask_config = normalise_dask_config(plan.execution)
 
         base_ctx = dict(plan.context)
@@ -94,11 +103,20 @@ class DaskBackend:
             # and HTCondor sends the files to EOS when the worker job exits.
             execution = execution_with_output_roots(plan, plan.execution)
             partition_ctx = partition_task_context(execution)
+        persistence = ClientPersistence(plan, outdir=str(base_ctx.get("outdir") or "."))
+        reused: dict[str, dict[str, Any]] = {}
+        if persistence.enabled:
+            for partition in plan.partitions:
+                restored = persistence.reuse(partition)
+                if restored is not None:
+                    reused[partition.id] = restored
+        to_run = [p for p in plan.partitions if p.id not in reused]
         tasks = build_dask_graph(
             plan,
             base_ctx=base_ctx,
             initial_values=global_side_values,
             partition_ctx=partition_ctx,
+            **({"partitions": to_run} if reused else {}),
         )
 
         try:
@@ -109,7 +127,9 @@ class DaskBackend:
 
             dashboard_link: str | None = None
             strategy_config: dict[str, Any] | None = None
-            if strategy == "htcondor":
+            if reused and not tasks:
+                task_results = []
+            elif strategy == "htcondor":
                 compute_with_htcondor = import_module(
                     "fasthep_distributed._dask._htcondor"
                 ).compute_with_htcondor
@@ -138,6 +158,15 @@ class DaskBackend:
                     dask_config=dask_config,
                     build_paths=BuildPaths.from_ctx(base_ctx),
                 )
+
+            if reused:
+                computed = iter(task_results)
+                task_results = [
+                    reused[partition.id]
+                    if partition.id in reused
+                    else next(computed)
+                    for partition in plan.partitions
+                ]
 
             delivery: dict[str, Any] | None = None
             destination = output_destination(execution) if partition_ctx else None
@@ -176,6 +205,8 @@ class DaskBackend:
 
             if delivery is not None:
                 _record_delivery(result, delivery)
+            if persistence.enabled:
+                result.summary["persistence"] = persistence.summary()
 
             if reporter is not None:
                 reporter.phase_completed("finalizing")
@@ -235,6 +266,7 @@ def build_dask_graph(
     base_ctx: dict[str, Any],
     initial_values: dict[tuple[str, str], Any] | None = None,
     partition_ctx: dict[str, Any] | None = None,
+    partitions: list[ExecutionPartition] | None = None,
 ) -> list[Any]:
     from dask import delayed  # noqa: PLC0415
 
@@ -243,7 +275,7 @@ def build_dask_graph(
     task_ctx = {**base_ctx, **dict(partition_ctx or {})}
     tasks: list[Any] = []
     annotations = _dask_resource_annotations_for_plan(plan)
-    for partition in plan.partitions:
+    for partition in plan.partitions if partitions is None else partitions:
         # The backend is currently partition-granular: one Dask task executes the
         # partition plan. These annotations route that task only when matching
         # Dask workers have been provisioned with the same resource names.
@@ -571,16 +603,27 @@ def _execute_partition_task(
     # not every node's event stream: serialising those separately takes a
     # worker past 20 GB on a 100k-event file.
     runtime_registry = runtime_registry_from_config(registry_cfg or plan.registry)
-    value_store = boundary_products_to_value_store(
-        extract_boundary_products(
-            plan,
-            value_store,
-            partition=partition,
-            boundary=plan_partition_boundary(plan, runtime_registry=runtime_registry),
-            runtime_registry=runtime_registry,
-            ctx=partition_ctx,
-        )
+    boundary = plan_partition_boundary(plan, runtime_registry=runtime_registry)
+    boundary_products = extract_boundary_products(
+        plan,
+        value_store,
+        partition=partition,
+        boundary=boundary,
+        runtime_registry=runtime_registry,
+        ctx=partition_ctx,
     )
+    settings = persistence_settings(plan.execution)
+    if settings.mode != "off":
+        boundary_products = persist_boundary_products(
+            boundary_products,
+            resolve_persistence(boundary, runtime_registry, settings),
+            plan=plan,
+            settings=settings,
+            outdir=str(partition_ctx.get("outdir") or "."),
+            store=recorder.store,
+            attempt_id=uuid.uuid4().hex,
+        )
+    value_store = boundary_products_to_value_store(boundary_products)
     partition_ctx["_hook_summary"] = hook_manager.usage_summary()
     partition_meta = partition.to_context()
     for warning in warnings:
