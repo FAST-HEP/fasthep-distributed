@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +158,23 @@ def test_partition_task_persists_selected_products(
     manifests = list((tmp_path / "artifacts" / "products").rglob("manifest.json"))
     assert len(manifests) == 1
     assert executed == ["events__toy__1"]
+
+
+def test_partition_task_stamps_the_hash_the_client_computed(
+    tmp_path: Path, executed: list[str]
+) -> None:
+    plan = _plan(tmp_path, mode="all")
+
+    _execute_partition_task(
+        plan,
+        plan.partitions[0],
+        base_ctx={"outdir": str(tmp_path)},
+        registry_cfg=REGISTRY,
+        plan_hash="client-hash",
+    )
+
+    manifest = next((tmp_path / "artifacts" / "products").rglob("manifest.json"))
+    assert json.loads(manifest.read_text())["plan_hash"] == "client-hash"
 
 
 def test_mode_off_result_is_unchanged(tmp_path: Path, executed: list[str]) -> None:
