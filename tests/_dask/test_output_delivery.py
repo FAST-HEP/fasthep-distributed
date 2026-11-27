@@ -154,7 +154,6 @@ def test_delivered_files_collect_the_files_recorded_at_the_destination() -> None
     elsewhere = OutputResult(kind="artifact", path="root://other.host//eos/x.root")
     manifest = ArtifactManifest(
         product_kind="artifact",
-        format="root",
         producer_node="write.Selected",
         output_name="artifact",
         dataset_name="b",
