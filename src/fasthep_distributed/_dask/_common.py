@@ -15,7 +15,6 @@ from hepflow.runtime.boundary import (
     plan_partition_boundary,
 )
 from hepflow.runtime.engine import (
-    _register_product_bindings,
     build_dataset_context,
     build_partition_context,
     execute_dataset_sinks,
@@ -28,14 +27,17 @@ from hepflow.runtime.engine import (
 )
 from hepflow.runtime.hooks.manager import HookManager
 from hepflow.runtime.materialize import materialize_final_products
+from hepflow.runtime.products import register_product_bindings
 from hepflow.runtime.provenance import ensure_runtime_provenance
 from hepflow.runtime.writer_manifests import write_writer_manifests
 
 from fasthep_distributed._dask._output_delivery import (
-    delivered_writer_records,
+    delivered_files,
+    delivery_statuses,
     execution_with_output_roots,
     output_destination,
     partition_task_context,
+    record_delivery,
     verify_delivery,
 )
 from fasthep_distributed._dask._pools import dask_resources_for_resource
@@ -143,9 +145,9 @@ class DaskBackend:
                 # The worker jobs have exited, so HTCondor has sent their files.
                 if reporter is not None:
                     reporter.phase_started("verifying_outputs")
-                delivery = verify_delivery(
-                    delivered_writer_records(task_results), destination
-                )
+                files = delivered_files(task_results, destination)
+                delivery = verify_delivery(files, destination)
+                record_delivery(task_results, delivery_statuses(files, delivery))
                 if reporter is not None:
                     reporter.phase_completed("verifying_outputs")
 
@@ -476,7 +478,7 @@ def build_dask_backend_result(
         outdir=str(final_ctx.get("outdir") or "."),
         registry_cfg=plan.registry,
     )
-    _register_product_bindings(final_ctx, product_items)
+    register_product_bindings(final_ctx, product_items, plan=plan)
 
     execute_final_nodes(
         plan,
