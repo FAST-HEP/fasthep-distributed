@@ -20,7 +20,7 @@ from hepflow.model.plan import ExecutionPartition, ExecutionPlan
 from hepflow.registry.loaders import runtime_registry_from_config
 from hepflow.runtime.boundary import plan_partition_boundary
 from hepflow.runtime.persistence.evidence import EvidenceLedger
-from hepflow.runtime.persistence.reuse import reuse_partition_products
+from hepflow.runtime.persistence.reuse import ReuseReport, reuse_partition_products
 from hepflow.runtime.persistence.save import persistence_root, provisional_plan_hash
 from hepflow.runtime.persistence.select import (
     PersistenceSelection,
@@ -88,6 +88,7 @@ class ClientPersistence:
             global_nodes=global_side_product_nodes(plan),
         )
         self.ledger = EvidenceLedger()
+        self.reuse_report = ReuseReport()
         # once, before any partition runs; workers stamp this, they do not recompute it
         self.plan_hash = provisional_plan_hash(plan)
 
@@ -107,6 +108,7 @@ class ClientPersistence:
             registry=self.registry,
             outdir=self.outdir,
             plan_hash=self.plan_hash,
+            report=self.reuse_report,
             ledger=self.ledger,
             store=scratch.store,
         )
@@ -126,4 +128,6 @@ class ClientPersistence:
         summary: dict[str, Any] = self.selection.to_dict()
         if self.ledger.consumptions:
             summary["consumed"] = list(self.ledger.consumptions)
+        if self.settings.reuse:
+            summary["reuse"] = self.reuse_report.to_dict()
         return summary
