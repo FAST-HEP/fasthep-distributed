@@ -396,3 +396,40 @@ def test_global_side_products_are_not_persisted_per_partition(
     assert not (tmp_path / "artifacts" / "products").exists()
     summary = _common.ClientPersistence(plan, outdir=str(tmp_path)).summary()
     assert summary["not_persisted"][0]["reason"] == "global side product"
+
+
+def test_summary_reports_reuse_for_every_partition(
+    tmp_path: Path, executed: list[str]
+) -> None:
+    plan = _plan(tmp_path, mode="all", reuse=True)
+    first = DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+    second = DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+
+    first_reuse = first.summary["persistence"]["reuse"]
+    assert (first_reuse["attempted"], first_reuse["reused"]) == (2, 0)
+    assert {s["reason"] for s in first_reuse["skipped"]} == {"not_published"}
+    second_reuse = second.summary["persistence"]["reuse"]
+    assert (second_reuse["attempted"], second_reuse["reused"]) == (2, 2)
+    assert second_reuse["skipped"] == []
+
+
+def test_a_plan_with_hooks_names_the_reason(tmp_path: Path) -> None:
+    plan = _plan(tmp_path, mode="all", reuse=True)
+    plan.execution_hooks = [{"kind": "hep.dataset_context", "events": []}]
+    persistence = _common.ClientPersistence(plan, outdir=str(tmp_path))
+
+    assert [persistence.reuse(p) for p in plan.partitions] == [None, None]
+
+    skipped = persistence.summary()["reuse"]["skipped"]
+    assert {s["reason"] for s in skipped} == {"execution_hooks"}
+    assert skipped[0]["detail"] == "hep.dataset_context"
+
+
+def test_no_reuse_section_when_reuse_is_off(
+    tmp_path: Path, executed: list[str]
+) -> None:
+    plan = _plan(tmp_path, mode="all")
+
+    result = DaskBackend().run(plan, ctx={"outdir": str(tmp_path)})
+
+    assert "reuse" not in result.summary["persistence"]
