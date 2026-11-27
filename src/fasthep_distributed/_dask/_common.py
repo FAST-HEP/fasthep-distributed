@@ -131,6 +131,7 @@ class DaskBackend:
                 base_ctx=base_ctx,
                 initial_values=global_side_values,
                 partition_ctx=partition_ctx,
+                plan_hash=persistence.plan_hash if persistence is not None else None,
                 **({"partitions": to_run} if reused else {}),
             )
 
@@ -281,6 +282,7 @@ def build_dask_graph(
     initial_values: dict[tuple[str, str], Any] | None = None,
     partition_ctx: dict[str, Any] | None = None,
     partitions: list[ExecutionPartition] | None = None,
+    plan_hash: str | None = None,
 ) -> list[Any]:
     from dask import delayed  # noqa: PLC0415
 
@@ -303,6 +305,7 @@ def build_dask_graph(
                     base_ctx=task_ctx,
                     registry_cfg=plan.registry,
                     initial_values=initial_values,
+                    plan_hash=plan_hash,
                 )
         else:
             task = delayed(_execute_partition_task)(
@@ -311,6 +314,7 @@ def build_dask_graph(
                 base_ctx=task_ctx,
                 registry_cfg=plan.registry,
                 initial_values=initial_values,
+                plan_hash=plan_hash,
             )
         tasks.append(task)
     return tasks
@@ -594,6 +598,8 @@ def _execute_partition_task(
     base_ctx: dict[str, Any],
     registry_cfg: dict[str, Any] | None,
     initial_values: dict[tuple[str, str], Any] | None = None,
+    # computed once by the client: a worker's copy of the plan is not hashed again
+    plan_hash: str | None = None,
 ) -> dict[str, Any]:
     partition_ctx = build_partition_context(
         plan,
@@ -641,6 +647,7 @@ def _execute_partition_task(
             outdir=str(partition_ctx.get("outdir") or "."),
             store=recorder.store,
             attempt_id=uuid.uuid4().hex,
+            plan_hash=plan_hash,
         )
     value_store = boundary_products_to_value_store(boundary_products)
     partition_ctx["_hook_summary"] = hook_manager.usage_summary()

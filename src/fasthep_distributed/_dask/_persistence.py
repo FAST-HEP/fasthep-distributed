@@ -21,7 +21,7 @@ from hepflow.registry.loaders import runtime_registry_from_config
 from hepflow.runtime.boundary import plan_partition_boundary
 from hepflow.runtime.persistence.evidence import EvidenceLedger
 from hepflow.runtime.persistence.reuse import reuse_partition_products
-from hepflow.runtime.persistence.save import persistence_root
+from hepflow.runtime.persistence.save import persistence_root, provisional_plan_hash
 from hepflow.runtime.persistence.select import (
     PersistenceSelection,
     global_side_product_nodes,
@@ -88,6 +88,8 @@ class ClientPersistence:
             global_nodes=global_side_product_nodes(plan),
         )
         self.ledger = EvidenceLedger()
+        # once, before any partition runs; workers stamp this, they do not recompute it
+        self.plan_hash = provisional_plan_hash(plan)
 
     @property
     def enabled(self) -> bool:
@@ -104,6 +106,7 @@ class ClientPersistence:
             settings=self.settings,
             registry=self.registry,
             outdir=self.outdir,
+            plan_hash=self.plan_hash,
             ledger=self.ledger,
             store=scratch.store,
         )
